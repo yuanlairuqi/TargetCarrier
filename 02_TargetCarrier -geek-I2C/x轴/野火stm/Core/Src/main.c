@@ -25,6 +25,7 @@
 #include "robot_uart.h"
 #include "board_config.h"
 #include "app_rtos.h"
+#include "motor_motion.h"
 
 /* USER CODE END Includes */
 
@@ -101,6 +102,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USART3 data path replaced by I2C; PB10/PB11 may now belong to I2C2. */
   /* USER CODE BEGIN 2 */
+  Motor_LimitsInit();
   AppRTOS_Start(&htim1, &BOARD_ROBOT_UART_HANDLE);
 
   /* USER CODE END 2 */

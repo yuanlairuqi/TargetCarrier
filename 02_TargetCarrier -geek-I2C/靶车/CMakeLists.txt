@@ -102,6 +102,23 @@ else()
 endif()
 add_test(NAME can_driver_regression COMMAND test_can_driver)
 
+# Compile the real controller with mocked I/O. GNU whole-program linking drops
+# hardware tasks that the host test does not start.
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    add_executable(test_reenable
+        firmware/stm32_f103/test/test_reenable.c
+        firmware/stm32_f103/src/dm_motor.c
+        "${PROTOCOL_DIR}/protocol.c"
+        "${LINKCORE_DIR}/lc_guard.c"
+        "${LINKCORE_DIR}/lc_can_tx.c")
+    target_include_directories(test_reenable PRIVATE
+        firmware/stm32_f103/test/mocks firmware/stm32_f103/include
+        firmware/lib/oled "${PROTOCOL_DIR}" "${LINKCORE_DIR}/include")
+    target_compile_options(test_reenable PRIVATE -O2 -flto -fwhole-program -UNDEBUG -Wall -Wextra)
+    target_link_options(test_reenable PRIVATE -flto -fwhole-program)
+    target_link_libraries(test_reenable PRIVATE m)
+    add_test(NAME reenable_can_regression COMMAND test_reenable)
+endif()
 
 # =============================================================================
 #  2. 三个交叉固件

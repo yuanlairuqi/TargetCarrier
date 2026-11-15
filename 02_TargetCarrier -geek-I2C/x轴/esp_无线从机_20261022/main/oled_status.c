@@ -38,9 +38,6 @@ static bool pins_valid(void)
 #ifdef CONFIG_ROBOT_UART_ENABLED
         CONFIG_ROBOT_UART_TX_GPIO,CONFIG_ROBOT_UART_RX_GPIO,
 #endif
-#ifdef CONFIG_ROBOT_PULSE_CAPTURE_ENABLED
-        CONFIG_ROBOT_PULSE_PUL_GPIO,CONFIG_ROBOT_PULSE_DIR_GPIO,
-#endif
         -1};
     for(unsigned i=0;i<sizeof(reserved)/sizeof(reserved[0]);i++)
         if(scl==reserved[i] || sda==reserved[i]) return false;
@@ -91,13 +88,13 @@ static void display_task(void *arg)
             snprintf(lines[1],22,"BLE %s STM %s",s.ble?"ON":"OFF",s.stm_online?"ON":"OFF");
             snprintf(lines[2],22,"SRC %s",s.source==1?"BLE":s.source==2?"ESP-NOW":"NONE");
             snprintf(lines[3],22,"CMD %s S%u",motion_name(s.motion),s.speed);
-            snprintf(lines[4],22,"ACK %s",!s.stm_online?"OFFLINE":s.confirmed?motion_name(s.stm_motion):"WAIT");
-            const char *stages[]={"IDLE","ACCEL","CRUISE","DECEL","DIR HOLD","DIR SETUP","FAULT"};
-            if(s.stm_online && s.stage<=6)snprintf(lines[4],22,"%s %u/%uHZ",stages[s.stage],s.current_hz,s.target_hz);
-            if(!s.capture_available) snprintf(lines[5],22,"PUL CAPTURE OFF");
-            else if(!s.pulse_recent) snprintf(lines[5],22,"PUL NO RECENT EDGES");
-            else snprintf(lines[5],22,"PUL %lu HZ D%u",(unsigned long)s.pulse_hz,s.direction);
-            snprintf(lines[6],22,"ERR E%u STM %u",s.error,s.stm_online?s.stm_error:0);
+            snprintf(lines[4],22,"STM32 OUTPUT STATUS");
+            if(!s.output_valid)snprintf(lines[5],22,"FEEDBACK LOST");
+            else if(!s.direction)snprintf(lines[5],22,"%u HZ DIR --",s.current_hz);
+            else snprintf(lines[5],22,"%u HZ DIR %s",s.current_hz,motion_name(s.direction));
+            if(!s.output_valid)snprintf(lines[6],22,s.latched?"LIMIT LAST LATCHED":"LIMIT UNKNOWN");
+            else if(s.limits)snprintf(lines[6],22,"LIMIT TRIP %s",s.limits==3?"L/R":s.limits==1?"L":"R");
+            else snprintf(lines[6],22,s.latched?"LIMIT LATCHED":"LIMIT CLEAR");
             snprintf(lines[7],22,"UP %lu S",(unsigned long)s.uptime);
             if(!oled_text_frame(&d,(const char (*)[22])lines,s.uptime/3U)){
                 online=false;ESP_LOGW(TAG,"OLED transfer failed; retry in 3 s");

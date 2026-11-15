@@ -64,6 +64,7 @@ typedef struct {
     float   torque_nm;
     uint8_t temp_mos;
     uint8_t temp_coil;
+    uint16_t pos_raw;     /* Exact position code for an MIT hold target. */
 } dm_feedback_t;
 
 /* ---- 编解码 (纯函数, 便于主机端单元测试) ---- */

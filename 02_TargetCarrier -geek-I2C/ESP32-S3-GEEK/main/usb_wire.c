@@ -21,11 +21,19 @@ bool master_output_confirmed(const uint8_t s[64],const uint8_t c[64]){
     bool hardware=(r[2]&0xb8)==0xb8&&!(r[2]&0x42)&&r[7]==0;
     if(!hardware||wire_get32(r+8)!=seq||wire_get32(r+12)!=seq||r[5]!=cmd[1]||r[6]!=cmd[2]||r[18]!=cmd[3])return false;
 
-    if(r[0]!=cmd[0])return false;
-    if(cmd[0]==4){
+    bool output_status=r[0]==4 && (r[19]&0x80);
+    uint8_t phase=output_status?(r[19]&0xf):r[19];
+    if(r[0]!=cmd[0] && !(output_status && cmd[0]==3))return false;
+    if(r[0]==4){
         uint16_t hz=(uint16_t)r[3]|(uint16_t)r[4]<<8,target=(uint16_t)r[16]|(uint16_t)r[17]<<8;
-        if(cmd[1]==0||cmd[1]==3)return r[1]==0&&r[19]==0&&hz==0;
-        return r[19]==2&&hz>0&&hz==target;
+        if(cmd[1]==0||cmd[1]==3)return r[1]==0&&phase==0&&hz==0;
+        if(cmd[0]==3)return hz>0&&(cmd[3]==1||r[1]==cmd[1]);
+        if(output_status && target) {
+            /* X STM32 reports the quantized 1 MHz timer setting. */
+            uint32_t period=(1000000U+target/2U)/target;
+            target=(uint16_t)((1000000U+period/2U)/period);
+        }
+        return phase==2&&hz>0&&hz==target;
     }
-    return cmd[3]==1||(r[1]==cmd[1]&&r[19]==cmd[1]);
+    return cmd[3]==1||(r[1]==cmd[1]&&phase==cmd[1]);
 }

@@ -48,25 +48,6 @@ config ROBOT_UART_BAUD
 endmenu
 
 menu "PUL/DIR hardware logic capture (3.3V inputs only)"
-config ROBOT_PULSE_CAPTURE_ENABLED
-    bool "Enable two-channel MCPWM hardware input capture"
-    default n
-    help
-        Measure the STM32 PA8/PB0 3.3V output nodes, with common ground.
-        Do not connect driver PUL+/PUL-/DIR+/DIR- terminals to ESP GPIOs.
-config ROBOT_PULSE_PUL_GPIO
-    int "PUL input GPIO"
-    range 0 48
-    default 6
-    depends on ROBOT_PULSE_CAPTURE_ENABLED
-config ROBOT_PULSE_DIR_GPIO
-    int "DIR input GPIO"
-    range 0 48
-    default 7
-    depends on ROBOT_PULSE_CAPTURE_ENABLED
-endmenu
-
-menu "GEEK ESP-NOW control input (private pairing required)"
 config ROBOT_ESPNOW_ENABLED
     bool "Enable encrypted ESP-NOW receiver alongside BLE"
     default n

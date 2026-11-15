@@ -18,7 +18,8 @@ typedef struct {
     uint16_t accel,decel,current_hz,target_hz;
     uint32_t forward_ms, reverse_ms;
     uint32_t ack, rx_count, last_motion_ms;
-    bool has_seq, connected, battery_valid, limit_latched;
+    bool has_seq, connected, battery_valid, limit_latched, require_stm_limits;
+    uint8_t output_status, output_direction;
     bool (*reset_limit)(void *ctx);
     void *reset_limit_ctx;
     uint16_t battery_mv;

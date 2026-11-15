@@ -10,6 +10,9 @@ static inline float gm_clip(float x,float lo,float hi){return fmaxf(lo,fminf(hi,
 static inline float gm_nearest(float angle,float reference,float pmax){
     const float turn=6.28318530718f;
     float p=angle+roundf((reference-angle)/turn)*turn;
+    /* The host orientation is quantized to 0.01 degree. Clip a rounding
+     * overshoot at a mapping endpoint before trying another turn. */
+    if (fabsf(p) <= pmax + 0.0001f) return gm_clip(p,-pmax,pmax);
     while(p>pmax)p-=turn;
     while(p< -pmax)p+=turn;
     return gm_clip(p,-pmax,pmax);

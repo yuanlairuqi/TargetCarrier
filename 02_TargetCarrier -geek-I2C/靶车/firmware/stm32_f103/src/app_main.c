@@ -48,7 +48,12 @@
 #define RAD2DEG  (180.0f / (float)M_PI)
 
 #define GAIN_RAMP_STEPS   500u    /* 500 步 @1kHz = 500ms 使能斜坡 */
-#define GAIN_RAMP_DOWN    5u      /* 失能斜坡: 每 ms 减 5 步 -> 100ms 收敛 */
+#define ARM_FB_MAX_AGE_MS 50u
+#define ARM_TIMEOUT_MS    200u
+#define ARM_STOP_SPEED    0.05f    /* rad/s, same stop criterion as the host */
+#define ARM_HOLD_ERROR    0.02f    /* rad, reject movement or a mapping discontinuity during hold */
+#define ARM_HOLD_KP_MAX   10.0f
+#define ARM_HOLD_KD_MAX   1.0f
 
 #define CTRL_TICK_HZ      1000u
 
@@ -109,8 +114,10 @@ typedef struct {
     float    torque_nm;
     uint8_t  temp_mos;
     uint8_t  err;
+    uint16_t pos_raw;
     bool     valid;
     uint32_t ms;
+    uint32_t sample;
 } fb_state_t;
 
 static fb_state_t g_fb;
@@ -128,6 +135,16 @@ static volatile uint32_t g_ctrl_ticks = 0;        /* TIM2 ISR 计数 */
 static volatile uint32_t g_link_drop_cmds = 0;    /* link: 队列满/解析丢弃 */
 
 /* ctrl 任务私有状态 */
+typedef enum {
+    ARM_IDLE,
+    ARM_PRIME,
+    ARM_PRIME_SENT,
+    ARM_ENABLE,
+    ARM_ENABLE_SENT,
+    ARM_CONFIRM,
+    ARM_ACTIVE,
+} arm_phase_t;
+
 static uint16_t s_target_flags = 0;
 static float    s_target_pos_rad = 0.0f;
 static float    s_target_vel_rad_s = 0.0f;
@@ -138,7 +155,15 @@ static float    s_target_kd = MOTOR_KD_DEFAULT;
 static float    s_kp_now = 0.0f;
 static float    s_kd_now = 0.0f;
 static uint16_t s_ramp = 0;
-static bool     s_enabled = false;
+static arm_phase_t s_arm_phase;
+static uint32_t s_arm_started;
+static uint32_t s_arm_confirmed_at;
+static uint32_t s_arm_fb_sample;
+static uint32_t s_disable_fb_sample;
+static uint16_t s_hold_raw;
+static float    s_hold_pos_rad;
+static bool     s_motion_requested;
+static lc_seq_gate_t s_applied_ctrl;
 static bool     s_estop = false;
 static bool     s_fault = false;
 static bool     s_link_lost = true;
@@ -146,7 +171,6 @@ static uint32_t s_gains_rx = 0;
 static uint32_t s_arm_reject_seen = 0;
 static uint32_t s_fail_streak = 0;
 static uint32_t s_prev_submit_fail = 0;
-static uint32_t s_fb_grace_until_ms = APP_FB_GRACE_MS;
 static uint32_t s_fault_mask_until_ms = 0;   /* 清错后忽略旧故障码的窗口 */
 static uint32_t s_seen_failsafe = 0;
 static uint32_t s_seen_recover = 0;
@@ -198,8 +222,10 @@ static void fb_update(const dm_feedback_t *fb)
     g_fb.torque_nm = fb->torque_nm;
     g_fb.temp_mos  = fb->temp_mos;
     g_fb.err       = fb->err;
+    g_fb.pos_raw   = fb->pos_raw;
     g_fb.valid     = true;
     g_fb.ms        = now_ms();
+    g_fb.sample++;
     taskEXIT_CRITICAL();
 }
 
@@ -222,6 +248,15 @@ static void can_request_safety(lc_can_safety_t tag, uint32_t id,
 
 static void can_submit_disable(void)
 {
+    fb_state_t fb;
+    fb_read(&fb);
+    s_disable_fb_sample = fb.sample;
+    s_arm_phase = ARM_IDLE;
+    s_motion_requested = false;
+    s_target_pos_rad = fb.valid ? fb.pos_rad : 0.0f;
+    s_target_vel_rad_s = 0.0f;
+    gm_reset(&s_motion, s_target_pos_rad);
+    s_ramp = 0;
     s_abort_mailboxes = true; /* Also cancel old ENABLE/motion already in hardware. */
     uint8_t d[8];
     uint32_t id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_DISABLE, d);
@@ -231,12 +266,12 @@ static void can_submit_disable(void)
     s_disable_sent = 1;
 }
 
-static void can_submit_enable(void)
+static void reject_arm(void)
 {
-    s_need_disable_burst = false;
-    uint8_t d[8];
-    uint32_t id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_ENABLE, d);
-    can_request_safety(LC_CAN_SAFETY_ENABLE, id, d);
+    lc_arm_force_safe(&s_arm);
+    s_arm.arm_reject++;
+    s_target_flags &= (uint16_t)~CTRL_FLAG_ENABLE;
+    can_submit_disable();
 }
 
 static void can_submit_clear_err(void)
@@ -327,24 +362,11 @@ static void ctrl_tick_isr(void)
 
 static void apply_command(const lc_cmd_t *cmd, uint32_t now)
 {
-    ctrl_target_t t;
-    ctrl_payload_t pl;
-    memset(&pl, 0, sizeof(pl));
-    pl.flags       = cmd->flags;
-    pl.mode        = cmd->mode;
-    pl.yaw_q       = cmd->yaw_q;
-    pl.pitch_q     = cmd->pitch_q;
-    pl.yawrate_q   = cmd->yawrate_q;
-    pl.pitchrate_q = cmd->pitchrate_q;
-    proto_payload_to_target(&pl, &t);
-
-    /* Orientation only; continuous speed ignores position entirely. */
-    float yaw_deg = t.yaw_deg;
-    float pitch_deg = clampf(t.pitch_deg, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG);
-    (void)pitch_deg;   /* 单轴云台: 俯仰暂不驱动 */
-
-    s_target_pos_rad   = clampf(yaw_deg * DEG2RAD, -MOTOR_PMAX, MOTOR_PMAX);
-    s_target_vel_rad_s = clampf(t.yaw_rate_dps * DEG2RAD, -MOTOR_VMAX, MOTOR_VMAX);
+    /* STOP can jump the command queue. Never apply a control frame older
+     * than the safety frame just applied. */
+    if (!lc_seq_accept(&s_applied_ctrl, cmd->seq)) {
+        return;
+    }
 
     /* ---- 急停 ---- */
     if (cmd->flags & CTRL_FLAG_ESTOP) {
@@ -364,7 +386,6 @@ static void apply_command(const lc_cmd_t *cmd, uint32_t now)
         can_submit_clear_err();
         s_fault = false;
         s_fail_streak = 0;
-        s_fb_grace_until_ms = now + APP_FB_GRACE_MS;
         /* 电机下一帧反馈里可能还带着旧的故障码, 500ms 内不据此重新置故障,
          * 否则"清错"永远清不掉 (旧实现也有这个问题)。 */
         s_fault_mask_until_ms = now + 500u;
@@ -376,18 +397,38 @@ static void apply_command(const lc_cmd_t *cmd, uint32_t now)
 
     /* ---- 授权状态机 ---- */
     bool was_armed = s_arm.armed;
+    bool requesting_enable = (cmd->flags & (CTRL_FLAG_ENABLE | CTRL_FLAG_ARM)) ==
+                             (CTRL_FLAG_ENABLE | CTRL_FLAG_ARM);
+    bool motion = (cmd->flags & CTRL_FLAG_MOTION) != 0u;
+    uint8_t token = proto_flags_token(cmd->flags);
+    if (requesting_enable && ((was_armed && token != s_arm.last_token) ||
+                              (motion && (s_arm_phase != ARM_ACTIVE ||
+                                          (int32_t)(cmd->rx_ms - s_arm_confirmed_at) <= 0)))) {
+        return;
+    }
     bool now_armed = lc_arm_update(&s_arm, cmd->flags);
-    if (now_armed && !was_armed) {
-        can_submit_enable();
-    } else if (!now_armed && was_armed) {
+    if (!now_armed && was_armed) {
         can_submit_disable();
-        lc_can_tx_clear_motion(&s_can_tx);
     }
     if (s_arm.arm_reject > s_arm_reject_seen) {
         s_arm_reject_seen = s_arm.arm_reject;
     }
 
-    s_target_flags = cmd->flags;
+    if (!now_armed) {
+        s_target_flags = (uint16_t)(cmd->flags & (uint16_t)~CTRL_FLAG_ENABLE);
+    } else if (motion) {
+        if (!s_motion_requested) {
+            s_ramp = 0;
+        }
+        s_target_flags = cmd->flags;
+        s_target_pos_rad = clampf((float)cmd->yaw_q * PROTO_ANGLE_SCALE * DEG2RAD,
+                                  -MOTOR_PMAX, MOTOR_PMAX);
+        s_target_vel_rad_s = clampf((float)cmd->yawrate_q * PROTO_RATE_SCALE * DEG2RAD,
+                                    -MOTOR_VMAX, MOTOR_VMAX);
+        s_motion_requested = true;
+    } else if (!s_motion_requested) {
+        s_target_flags = (uint16_t)(cmd->flags & (uint16_t)~CTRL_FLAG_VELOCITY);
+    }
 }
 
 /* ================================================================== */
@@ -409,6 +450,43 @@ static bool fb_is_fresh(const fb_state_t *fb, uint32_t now, uint32_t *age_out)
     return age <= APP_FB_TIMEOUT_MS;
 }
 
+static void ctrl_service_arm_can(can_tx_done_t done)
+{
+    if (s_arm_phase == ARM_PRIME_SENT || s_arm_phase == ARM_ENABLE_SENT) {
+        /* These frames use an otherwise empty CAN TX pipeline, so the
+         * hardware completion belongs to the frame we sent. */
+        if (done.failed) {
+            reject_arm();
+        } else if (done.ok) {
+            if (s_arm_phase == ARM_PRIME_SENT) {
+                s_arm_phase = ARM_ENABLE;
+            } else {
+                fb_state_t fb;
+                fb_read(&fb);
+                s_arm_fb_sample = fb.sample;
+                s_arm_phase = ARM_CONFIRM;
+            }
+        }
+        return;
+    }
+    if (!can_drv_tx_idle()) {
+        return;
+    }
+    uint8_t data[8];
+    uint32_t id;
+    if (s_arm_phase == ARM_PRIME) {
+        dm_mit_cmd_t neutral = {0};
+        id = dm_pack_mit(MOTOR_CAN_ID, &neutral, data);
+        data[0] = (uint8_t)(s_hold_raw >> 8);
+        data[1] = (uint8_t)s_hold_raw;
+    } else {
+        id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_ENABLE, data);
+    }
+    if (can_drv_send(id, data, sizeof(data))) {
+        s_arm_phase = s_arm_phase == ARM_PRIME ? ARM_PRIME_SENT : ARM_ENABLE_SENT;
+    }
+}
+
 static void ctrl_service_can(uint32_t now)
 {
     if (!can_drv_is_recovering() && can_drv_lock(0)) {
@@ -421,12 +499,16 @@ static void ctrl_service_can(uint32_t now)
             can_drv_abort_all();
             s_abort_mailboxes = false;
         }
-        for (uint8_t i = 0; i < 3u; ++i) {
-            const lc_can_frame_t *f = lc_can_tx_peek(&s_can_tx);
-            if (f == NULL) break;
-            bool ok = can_drv_send(f->id, f->data, f->len);
-            lc_can_tx_pop(&s_can_tx, ok);
-            if (!ok) break;
+        if (s_arm_phase >= ARM_PRIME && s_arm_phase <= ARM_ENABLE_SENT) {
+            ctrl_service_arm_can(done);
+        } else {
+            for (uint8_t i = 0; i < 3u; ++i) {
+                const lc_can_frame_t *f = lc_can_tx_peek(&s_can_tx);
+                if (f == NULL) break;
+                bool ok = can_drv_send(f->id, f->data, f->len);
+                lc_can_tx_pop(&s_can_tx, ok);
+                if (!ok) break;
+            }
         }
         can_drv_unlock();
     }
@@ -483,10 +565,8 @@ static void ctrl_apply_watchdogs(uint32_t now)
     /* ---- 电机反馈看门狗: 使能中 200ms 无反馈 -> 故障失能 ---- */
     fb_state_t fb;
     fb_read(&fb);
-    uint32_t age = 0;
-    bool fresh = fb_is_fresh(&fb, now, &age);
-    bool grace = (int32_t)(now - s_fb_grace_until_ms) < 0;
-    if (s_enabled && !fresh && !grace) {
+    bool fresh = fb_is_fresh(&fb, now, NULL);
+    if (s_arm_phase != ARM_IDLE && !fresh) {
         s_fault = true;
         lc_arm_force_safe(&s_arm);
         s_target_flags &= (uint16_t)~CTRL_FLAG_ENABLE;
@@ -503,6 +583,47 @@ static void ctrl_apply_watchdogs(uint32_t now)
             s_target_flags &= (uint16_t)~CTRL_FLAG_ENABLE;
             can_submit_disable();
         }
+    }
+}
+
+static void ctrl_update_arm(const fb_state_t *fb, uint32_t now)
+{
+    if (!lc_arm_armed(&s_arm)) {
+        return;
+    }
+    const bool feedback_ok = fb->valid && lc_elapsed_ms(now, fb->ms) <= ARM_FB_MAX_AGE_MS;
+    const bool stopped = feedback_ok && fabsf(fb->vel_rad_s) <= ARM_STOP_SPEED;
+    if (s_estop || s_fault || s_link_lost || can_drv_is_recovering() || !can_drv_is_healthy()) {
+        reject_arm();
+    } else if (s_arm_phase == ARM_IDLE) {
+        if (!stopped || fb->err != 0u || fb->sample == s_disable_fb_sample ||
+            s_need_disable_burst || s_abort_mailboxes || s_can_tx.safety_pending[LC_CAN_SAFETY_DISABLE]) {
+            reject_arm();
+            return;
+        }
+        s_hold_pos_rad = fb->pos_rad;
+        s_hold_raw = fb->pos_raw;
+        s_target_pos_rad = fb->pos_rad;
+        s_target_vel_rad_s = 0.0f;
+        s_motion_requested = false;
+        s_ramp = 0;
+        gm_reset(&s_motion, fb->pos_rad);
+        lc_can_tx_clear_motion(&s_can_tx);
+        s_arm_started = now;
+        s_arm_phase = ARM_PRIME;
+    } else if (s_arm_phase != ARM_ACTIVE) {
+        if (!stopped || fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR ||
+            lc_elapsed_ms(now, s_arm_started) >= ARM_TIMEOUT_MS ||
+            (fb->err != 0u && (s_arm_phase < ARM_ENABLE_SENT || fb->err != 1u))) {
+            reject_arm();
+        } else if (s_arm_phase == ARM_CONFIRM && fb->err == 1u &&
+                   fb->sample != s_arm_fb_sample) {
+            s_arm_confirmed_at = now;
+            s_arm_phase = ARM_ACTIVE;
+        }
+    } else if (fb->err != 1u ||
+               (!s_motion_requested && (!stopped || fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR))) {
+        reject_arm();
     }
 }
 
@@ -525,9 +646,11 @@ static void ctrl_step(uint32_t now)
     /* ---- 2. 增益帧 ---- */
     gain_msg_t gm;
     while (xQueueReceive(s_gain_q, &gm, 0) == pdTRUE) {
-        s_target_kp = clampf(gm.kp, MOTOR_KP_MIN, MOTOR_KP_MAX);
-        s_target_kd = clampf(gm.kd, MOTOR_KD_MIN, MOTOR_KD_MAX);
-        s_gains_rx++;
+        if (s_arm_phase == ARM_IDLE) {
+            s_target_kp = clampf(gm.kp, MOTOR_KP_MIN, MOTOR_KP_MAX);
+            s_target_kd = clampf(gm.kd, MOTOR_KD_MIN, MOTOR_KD_MAX);
+            s_gains_rx++;
+        }
     }
 
     /* ---- 3. 参数请求 (低优先级 CAN) ---- */
@@ -544,34 +667,15 @@ static void ctrl_step(uint32_t now)
     fb_read(&fb);
     uint32_t fb_age = 0;
     bool fb_fresh = fb_is_fresh(&fb, now, &fb_age);
-    bool grace = (int32_t)(now - s_fb_grace_until_ms) < 0;
-    bool fb_ok = fb_fresh || (!fb.valid && grace);
-
-    bool want_enable = lc_arm_armed(&s_arm) && !s_estop && !s_fault &&
-                       !s_link_lost && !can_drv_is_recovering() && fb_ok;
-
-    /* ---- 6. 增益斜坡 ---- */
-    if (want_enable) {
-        if (s_ramp < GAIN_RAMP_STEPS) {
-            s_ramp++;
-        }
-    } else if (s_ramp > 0u) {
-        s_ramp = (s_ramp > GAIN_RAMP_DOWN) ? (uint16_t)(s_ramp - GAIN_RAMP_DOWN) : 0u;
+    ctrl_update_arm(&fb, now);
+    bool enabled = s_arm_phase == ARM_ACTIVE;
+    bool motion = enabled && s_motion_requested;
+    float ratio = enabled ? (float)s_ramp / (float)GAIN_RAMP_STEPS : 0.0f;
+    if (enabled && s_ramp < GAIN_RAMP_STEPS) {
+        s_ramp++;
     }
-    float ratio = (float)s_ramp / (float)GAIN_RAMP_STEPS;
-    s_kp_now = s_target_kp * ratio;
-    s_kd_now = s_target_kd * ratio;
-
-    /* ---- 7. 使能/失能边沿 ---- */
-    if (want_enable && !s_enabled) {
-        s_enabled = true;
-        can_submit_enable();
-        s_fail_streak = 0;
-    } else if (!want_enable && s_enabled) {
-        s_enabled = false;
-        can_submit_disable();
-        lc_can_tx_clear_motion(&s_can_tx);
-    }
+    s_kp_now = (motion ? s_target_kp : fminf(s_target_kp, ARM_HOLD_KP_MAX)) * ratio;
+    s_kd_now = (motion ? s_target_kd : fminf(s_target_kd, ARM_HOLD_KD_MAX)) * ratio;
 
     /* ---- 8. 失能补发: 提交成功后 10ms 内再补 3 帧 (取代旧的"一次 50 帧") ---- */
     if (s_need_disable_burst) {
@@ -593,26 +697,27 @@ static void ctrl_step(uint32_t now)
     float dt = s_motion_at ? (float)lc_elapsed_ms(now, s_motion_at) * 0.001f : 0.001f;
     s_motion_at = now;
     /* A zero-gain enable is a diagnostic enable, never a hidden trajectory. */
-    bool drive = want_enable && (velocity_mode ? s_target_kd > 0.0f : s_target_kp > 0.0f);
+    bool drive = motion && (velocity_mode ? s_target_kd > 0.0f : s_target_kp > 0.0f);
     gm_step(&s_motion, drive, velocity_mode, s_target_pos_rad,
             s_target_vel_rad_s, fb.valid ? fb.pos_rad : 0.0f, dt,
             (velocity_mode ? GIMBAL_MANUAL_SPEED_MAX_DPS : GIMBAL_SPEED_MAX_DPS) * DEG2RAD, GIMBAL_ACCEL_DPS2 * DEG2RAD,
             GIMBAL_JERK_DPS3 * DEG2RAD, MOTOR_PMAX);
-    mit.pos_rad   = velocity_mode ? 0.0f : s_motion.position;
+    mit.pos_rad   = motion && velocity_mode ? 0.0f : s_motion.position;
     mit.vel_rad_s = s_motion.velocity * ratio;
-    mit.kp        = velocity_mode ? 0.0f : s_kp_now;
+    mit.kp        = motion && velocity_mode ? 0.0f : s_kp_now;
     mit.kd        = s_kd_now;
     /* Match the DM MIT speed example: no direct torque feedforward. */
     mit.torque_nm = 0.0f;
-    if (s_ramp == 0u) {
-        mit.pos_rad = fb.valid ? fb.pos_rad : 0.0f;
-    }
-
     lc_can_frame_t mf;
     memset(&mf, 0, sizeof(mf));
     mf.len  = 8u;
     mf.prio = (uint8_t)LC_CAN_PRIO_MOTION;
     mf.id   = dm_pack_mit(MOTOR_CAN_ID, &mit, mf.data);
+    if (!motion && fb.valid) {
+        uint16_t pos = s_arm_phase == ARM_IDLE ? fb.pos_raw : s_hold_raw;
+        mf.data[0] = (uint8_t)(pos >> 8);
+        mf.data[1] = (uint8_t)pos;
+    }
     (void)lc_can_tx_request(&s_can_tx, &mf);
 
     /* ---- 10. CAN 发送协调 ---- */
@@ -636,8 +741,10 @@ static void ctrl_step(uint32_t now)
     snap.fb_age_ms     = fb.valid ? fb_age : 0xFFFFFFFFu;
     snap.can_fail      = (uint16_t)((s_can_tx.submit_fail > 0xFFFFu)
                                     ? 0xFFFFu : s_can_tx.submit_fail);
-    snap.armed         = s_arm.armed;
-    snap.enabled       = s_enabled;
+    /* Echo the internal authorization token, but advertise readiness only
+     * after the CAN enable and the motor's post-enable feedback both arrive. */
+    snap.armed         = enabled;
+    snap.enabled       = enabled;
     snap.estop         = s_estop;
     snap.fault         = s_fault;
     snap.feedback_valid = fb.valid;
@@ -669,6 +776,7 @@ static void ctrl_step(uint32_t now)
 static void ctrl_task(void *arg)
 {
     (void)arg;
+    can_submit_disable();
 
     /* 先把 1kHz 硬件节拍打开 (此时调度器已在运行, 中断里可以安全用 FromISR)。 */
     timer_drv_start_1khz(ctrl_tick_isr);
@@ -1056,10 +1164,10 @@ void app_setup(void)
 
     lc_cmdq_init(&s_cmdq);
     lc_arm_init(&s_arm);
+    lc_seq_gate_init(&s_applied_ctrl);
     lc_can_tx_init(&s_can_tx);
     memset(&g_fb, 0, sizeof(g_fb));
     memset(&g_snap, 0, sizeof(g_snap));
-    s_fb_grace_until_ms = APP_FB_GRACE_MS;   /* 上电后 1s 内允许无反馈 */
 
     /* ---- 3. 任务 (静态分配, 优先级/栈见 app_tasks.h) ---- */
     s_ctrl_task = xTaskCreateStatic(ctrl_task, "ctrl", APP_STACK_CTRL_WORDS, NULL,

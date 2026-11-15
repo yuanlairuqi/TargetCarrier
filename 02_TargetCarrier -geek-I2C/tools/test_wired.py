@@ -16,6 +16,6 @@ run('codec',[D/'tc_protocol.c',D/'wl_codec.c',T/'test_codec.c'],[D])
 run('stm-driver',[D/'tc_protocol.c',T/'test_stm32.c'],[T/'mocks',D])
 run('esp-driver',[D/'tc_protocol.c',T/'test_esp_bus.c'],[T/'esp_mocks',D])
 stm=R/'x轴/野火stm';esp=R/'x轴/esp_无线从机_20261022';inc=[stm/x for x in ['tests/stubs','Core/Inc','App/Board','App/Motion','App/Link']]+[esp/'main',D]
-run('x-business',[T/'test_x_business.c',D/'tc_protocol.c',D/'wl_codec.c',stm/'App/Link/robot_uart.c',stm/'App/Link/robot_wire.c',stm/'App/Link/robot_peer.c',stm/'App/Motion/motor_motion.c',stm/'App/Motion/motion_profile.c',esp/'main/robot_bridge.c'],inc,['MOTOR_HOST_TEST','ROBOT_UART_HOST_TEST','MOTOR_CONTINUOUS_ENABLED=1','MOTOR_STARTUP_ONESHOT_ENABLED=0'])
-vehicle=R/'靶车/靶车/firmware/lib';run('target-guard',[vehicle/'linkcore/test/test_linkcore.c',*sorted((vehicle/'linkcore').glob('*.c'))],[vehicle/'linkcore/include',vehicle/'protocol'])
+run('x-business',[T/'test_x_business.c',D/'tc_protocol.c',D/'wl_codec.c',stm/'App/Link/robot_uart.c',stm/'App/Link/robot_wire.c',stm/'App/Link/robot_peer.c',stm/'App/Motion/motor_motion.c',stm/'App/Motion/motion_profile.c',esp/'main/robot_bridge.c',esp/'main/robot_control.c'],inc,['MOTOR_HOST_TEST','ROBOT_UART_HOST_TEST','MOTOR_CONTINUOUS_ENABLED=1','MOTOR_STARTUP_ONESHOT_ENABLED=0'])
+vehicle=R/'靶车/靶车/firmware/lib';vehicle=vehicle if vehicle.is_dir() else R/'靶车/firmware/lib';run('target-guard',[vehicle/'linkcore/test/test_linkcore.c',*sorted((vehicle/'linkcore').glob('*.c'))],[vehicle/'linkcore/include',vehicle/'protocol'])
 print('All production-source host tests passed; no physical hardware simulated as evidence')

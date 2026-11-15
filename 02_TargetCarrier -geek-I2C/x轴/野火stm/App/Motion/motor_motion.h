@@ -33,6 +33,13 @@ extern volatile MotorStatus g_motor_status; /* inspect using SWD */
 /* One request per reset; repeated calls cannot launch another move. */
 void Motor_StartOnce(TIM_HandleTypeDef *timer);
 void Motor_Process(void);
+void Motor_LimitsInit(void);
+uint8_t Motor_LimitStatus(void); /* bit 0 PB14, bit 1 PB13, bit 2 latched */
+bool Motor_LimitTryReset(void);
+uint8_t Motor_OutputSnapshot(uint16_t *hz, uint8_t *direction);
+#ifdef MOTOR_HOST_TEST
+void Motor_TestLimitPins(uint16_t high_pins, bool falling_edge);
+#endif
 /* Cancels the pending/current one-shot; cannot restart it before reset. */
 void Motor_Stop(void);
 bool Motor_OutputStopped(void); /* register state, not encoder feedback */

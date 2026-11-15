@@ -1,4 +1,5 @@
 #include "robot_control.h"
+#include "robot_wire.h"
 #include <string.h>
 static uint32_t read32(const uint8_t *p) {
     return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
@@ -11,6 +12,7 @@ void robot_stop(robot_control_t *r,uint8_t error) {
     if(r->limit_latched)error=ROBOT_LIMIT_STOP;
     r->motion=ROBOT_STOP;r->speed=0;r->error=error;++r->revision;
     r->mode=0;r->forward_ms=0;r->reverse_ms=0;
+    if (r->accel==X_RESET_ACCEL && r->decel==X_RESET_DECEL) r->accel=r->decel=200;
 }
 void robot_latch_limit(robot_control_t *r) {
     bool changed=!r->limit_latched || r->motion!=ROBOT_STOP || r->error!=ROBOT_LIMIT_STOP;
@@ -18,7 +20,7 @@ void robot_latch_limit(robot_control_t *r) {
     if(changed)robot_stop(r,ROBOT_LIMIT_STOP);
 }
 bool robot_can_move(const robot_control_t *r) {
-    if(r->limit_latched)return false;
+    if(r->limit_latched || (r->require_stm_limits && !(r->output_status & X_OUTPUT_PRESENT)))return false;
     return !r->uart_configured || (r->stm_online&&(r->stm_flags&1)&&!(r->stm_flags&16)&&r->stm_error==0&&r->link_error==0);
 }
 void robot_connection(robot_control_t *r, bool connected) {
@@ -92,11 +94,25 @@ void robot_status(const robot_control_t *r, uint32_t now, uint8_t out[ROBOT_STAT
     out[5] = r->motion; out[6] = r->speed; out[7] = r->error?r->error:r->link_error;
     write32(out+8,r->ack);write32(out+12,r->stm_ack);out[16]=(uint8_t)(now/1000);out[17]=(uint8_t)((now/1000)>>8);
     out[18]=r->uart_configured?r->stm_mode:r->mode;out[19]=r->uart_configured?r->stm_phase:r->motion;
-    if(r->protocol==4){
+    if(r->protocol==4 || r->require_stm_limits){
         out[0]=4;out[3]=(uint8_t)r->current_hz;out[4]=(uint8_t)(r->current_hz>>8);
         out[16]=(uint8_t)r->target_hz;out[17]=(uint8_t)(r->target_hz>>8);
         out[2]&=(uint8_t)~4U; /* v4 frequency replaces the unused battery field. */
         if(!(r->stm_flags&32U))out[2]&=(uint8_t)~(16U|32U);
+    }
+    if (r->require_stm_limits) {
+        bool valid = r->stm_online && (r->output_status & X_OUTPUT_PRESENT);
+        out[1] = valid ? r->output_direction : 0;
+        out[19] = valid ? (uint8_t)(0x80U | ((r->output_status & 7U)<<4) | (r->stm_phase&15U)) : 0;
+        if (!valid) {
+            out[2] &= (uint8_t)~(8U|16U|32U|64U);
+            out[3]=out[4]=out[16]=out[17]=0;
+        } else {
+            /* A healthy, locked peer can still confirm an immediate STOP. */
+            if (r->stm_error==X_PEER_LIMIT) out[2]&=(uint8_t)~64U;
+            if (r->stm_flags&PEER_READY) out[2]|=16U;
+            if (r->stm_flags&PEER_APPLIED) out[2]|=32U;
+        }
     }
 
 }

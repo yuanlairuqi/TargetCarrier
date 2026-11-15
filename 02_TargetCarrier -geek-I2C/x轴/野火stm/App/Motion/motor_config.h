@@ -28,7 +28,7 @@
 #define MOTOR_CONTINUOUS_ENABLED    1U
 #endif
 #define MOTOR_CONTINUOUS_MIN_HZ     200U
-#define MOTOR_CONTINUOUS_MAX_HZ     2000U
+#define MOTOR_CONTINUOUS_MAX_HZ     4000U
 #ifndef MOTOR_RAMP_FIRST_HZ
 #define MOTOR_RAMP_FIRST_HZ 20U /* Software output floor, not a motor rating. */
 #endif

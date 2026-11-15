@@ -41,7 +41,9 @@ bool bridge_tick(robot_bridge_t *b,uint32_t now,wire_frame_t *out) {
         if(b->sent&&(uint32_t)(now-b->sent_at)>=BRIDGE_ACK_MS) {
             b->online=false;b->peer_flags=0;b->battery_mv=0xffff;b->error=BRIDGE_ACK_TIMEOUT;
             // Drop queued movement and supersede failed movement with STOP.
-            b->desired_motion=0;b->desired_speed=0;b->queued=false;make_command(b,now);
+            b->desired_motion=0;b->desired_speed=0;b->queued=false;
+            if(b->accel==X_RESET_ACCEL && b->decel==X_RESET_DECEL)b->accel=b->decel=200;
+            make_command(b,now);
         }
         if(!b->sent||(uint32_t)(now-b->last_tx)>=BRIDGE_RETRY_MS) {
             *out=b->inflight;if(!b->sent)b->sent_at=now;b->sent=true;b->last_tx=now;return true;
@@ -58,7 +60,7 @@ bool bridge_tick(robot_bridge_t *b,uint32_t now,wire_frame_t *out) {
 }
 bool bridge_receive(robot_bridge_t *b,const wire_frame_t *f,uint32_t now) {
     if(!b->enabled||f->type!=WIRE_STATUS||f->session!=b->session||f->payload[0]>2||f->payload[1]>100||
-        (f->payload[2]&~63)||f->payload[3]>4||f->payload[10]>1||f->payload[11]>((f->payload[2]&PEER_PROFILE)?6:2))return false;
+        (f->payload[2]&~63)||f->payload[3]>X_PEER_LIMIT||f->payload[10]>1||f->payload[11]>((f->payload[2]&PEER_PROFILE)?6:2))return false;
     uint32_t phone=wire_u32(f->payload+6);
     bool current=b->waiting&&f->token==b->inflight.token&&phone==wire_u32(b->inflight.payload+4);
     bool prior=b->confirmed&&f->token==b->completed_token&&phone==b->completed_phone;
@@ -74,6 +76,18 @@ bool bridge_receive(robot_bridge_t *b,const wire_frame_t *f,uint32_t now) {
     if((f->payload[2]&PEER_DEMO)&&(f->payload[2]&PEER_APPLIED))return false;
 
     if(b->protocol==4 && !extended)return false;
+    uint8_t output=f->payload[15];
+    uint16_t hz=(uint16_t)f->payload[16] | (uint16_t)f->payload[17]<<8;
+    uint8_t dir=(output>>X_OUTPUT_DIR_SHIFT)&3U;
+    if (output&X_OUTPUT_PRESENT) {
+        bool locked=(output&X_LIMIT_LATCHED)!=0;
+        if ((output&0x60U) || dir>2 || hz>4000U || (!!hz != !!dir) ||
+            (locked && (hz || (f->payload[2]&PEER_READY))) ||
+            ((output&3U) && !locked) || (locked != (f->payload[3]==X_PEER_LIMIT)))
+            return false;
+    } else if (output || hz || f->payload[3]==X_PEER_LIMIT) return false;
+    b->output_status=output;
+    b->output_hz=hz;
     b->peer_requested=extended?f->payload[12]:f->payload[0];
     b->current_hz=extended?((uint16_t)f->payload[4]|(uint16_t)f->payload[5]<<8):0;
     b->target_hz=extended?((uint16_t)f->payload[13]|(uint16_t)f->payload[14]<<8):0;
@@ -82,9 +96,12 @@ bool bridge_receive(robot_bridge_t *b,const wire_frame_t *f,uint32_t now) {
     b->peer_flags=f->payload[2];b->peer_error=f->payload[3];
     b->battery_mv=(uint16_t)f->payload[4]|(uint16_t)f->payload[5]<<8;
     if(b->battery_mv==0xffff)b->peer_flags&=~PEER_BATTERY;
-    b->error=b->peer_error?BRIDGE_REJECTED:BRIDGE_OK;
+    b->error=b->peer_error && b->peer_error!=X_PEER_LIMIT ? BRIDGE_REJECTED : BRIDGE_OK;
     if(current) {
         b->waiting=false;b->confirmed=true;b->completed_token=f->token;b->completed_phone=phone;b->ack=phone;
+        b->reset_confirmed=!b->peer_error && (b->peer_flags&PEER_APPLIED) && b->inflight.type==WIRE_PROFILE && !b->inflight.payload[0] &&
+            ((uint16_t)b->inflight.payload[14] | (uint16_t)b->inflight.payload[15]<<8)==X_RESET_ACCEL &&
+            ((uint16_t)b->inflight.payload[16] | (uint16_t)b->inflight.payload[17]<<8)==X_RESET_DECEL;
         if(b->peer_error)b->queued=false;
     }
     return true;

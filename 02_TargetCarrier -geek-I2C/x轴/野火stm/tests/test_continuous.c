@@ -40,11 +40,11 @@ int main(void)
   assert(g_motor_status.state == MOTOR_CONTINUOUS_RUNNING);
   assert(Motor_OutputActive());
   assert((test_tim1.CR1 & TIM_CR1_CEN) && !(test_tim1.CR1 & TIM_CR1_OPM));
-  assert(test_tim1.ARR == 499 && test_tim1.CCR1 == 250 && test_tim1.RCR == 0);
-  test_tim1.CNT = 700; test_tim1.EGR = 0;
+  assert(test_tim1.ARR == 249 && test_tim1.CCR1 == 125 && test_tim1.RCR == 0);
+  test_tim1.CNT = 100; test_tim1.EGR = 0;
   assert(Motor_SetContinuous(1, 1));
   assert(test_tim1.ARR == 4999 && test_tim1.CCR1 == 2500);
-  assert(test_tim1.CNT == 700 && test_tim1.EGR == 0 && !(test_tim1.CR1 & TIM_CR1_UDIS));
+  assert(test_tim1.CNT == 100 && test_tim1.EGR == 0 && !(test_tim1.CR1 & TIM_CR1_UDIS));
   assert(Motor_SetContinuous(2, 100));
   assert(Motor_OutputStopped() && dir == MOTOR_DIRECTION_LEVEL);
   assert(!Motor_OutputActive());

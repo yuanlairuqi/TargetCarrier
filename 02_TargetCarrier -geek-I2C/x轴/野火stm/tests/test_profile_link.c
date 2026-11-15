@@ -41,7 +41,20 @@ static void command(uint8_t op,uint8_t speed,uint8_t mode,uint16_t f,uint16_t r,
  wire_frame_t out,reply;assert(bridge_tick(&bridge,now,&out));
  assert(out.type==WIRE_PROFILE);
  uint8_t raw[WIRE_SIZE];wire_encode(&out,raw);wire_frame_t decoded;assert(wire_decode(raw,&decoded));
- assert(peer_receive(&peer,&decoded,now,&reply));assert(bridge_receive(&bridge,&reply,now));
+ assert(peer_receive(&peer,&decoded,now,&reply));
+ uint16_t output_hz;
+ uint8_t output_dir;
+ uint8_t limits=Motor_OutputSnapshot(&output_hz,&output_dir);
+ reply.payload[15]=X_OUTPUT_PRESENT | (output_dir << X_OUTPUT_DIR_SHIFT) | limits;
+ reply.payload[16]=(uint8_t)output_hz;
+ reply.payload[17]=(uint8_t)(output_hz >> 8);
+ if(output_hz==4000){
+   wire_frame_t bad=reply;
+   bad.payload[16]=(uint8_t)4001;
+   bad.payload[17]=(uint8_t)(4001 >> 8);
+   assert(!bridge_receive(&bridge,&bad,now));
+ }
+ assert(bridge_receive(&bridge,&reply,now));
  control_feedback(&robot,&bridge);assert(bridge.error==0);
  uint8_t status[20];robot_status(&robot,now,status);assert(status[0]==4);assert(status[5]==op);
 }
@@ -63,25 +76,28 @@ int main(void){
  wire_frame_t stale={.type=WIRE_COMMAND,.session=124,.token=peer.token+1},reply;stale.payload[0]=1;stale.payload[1]=40;stale.payload[2]=244;stale.payload[3]=1;
  assert(!peer_receive(&peer,&stale,now,&reply));stale.session=123;stale.token=peer.token-1;assert(peer_receive(&peer,&stale,now,&reply));peer_status(&peer,&reply);assert(peer.extended && (reply.payload[2]&PEER_PROFILE));
  puts("PASS rejected legacy session cannot downgrade active v4 mode");
- run(10000,1,100,0,200,200);Motor_ProfileStatus(&s);assert(s.phase==MP_CRUISE && s.hz==MOTOR_CONTINUOUS_MAX_HZ);
+ run(20000,1,100,0,200,200);Motor_ProfileStatus(&s);
+ assert(s.phase==MP_CRUISE && s.hz==4000 && bridge.output_hz==4000 && robot.current_hz==4000);
+ assert(test_tim1.ARR==249 && test_tim1.CCR1==125);
+ puts("PASS 100 percent produces 4000 Hz and ESP accepts 4000 Hz but rejects 4001 Hz");
  run(1500,3,0,0,200,100);Motor_ProfileStatus(&s);assert(s.phase==MP_DECEL && s.hz>=MOTOR_CONTINUOUS_MAX_HZ-160 && s.hz<=MOTOR_CONTINUOUS_MAX_HZ-140);
  puts("PASS repeated soft STOP heartbeats do not reset deceleration and preserve leases beyond one second");
  step(501);assert(Motor_OutputStopped());assert(peer.error==PEER_TIMEOUT);
  puts("PASS lease expiration during soft STOP immediately removes pulses");
  command(0,0,0,0,0,200,200);
- run(2600,1,100,0,1000,1000);Motor_ProfileStatus(&s);assert(s.hz==MOTOR_CONTINUOUS_MAX_HZ);
+ run(4200,1,100,0,1000,1000);Motor_ProfileStatus(&s);assert(s.hz==MOTOR_CONTINUOUS_MAX_HZ);
  run(100,2,100,0,1000,1000);Motor_ProfileStatus(&s);assert(s.direction==1 && s.phase==MP_DECEL);
- run(4500,2,100,0,1000,1000);Motor_ProfileStatus(&s);assert(s.direction==2 && s.phase==MP_CRUISE);
+ run(8500,2,100,0,1000,1000);Motor_ProfileStatus(&s);assert(s.direction==2 && s.phase==MP_CRUISE);
  puts("PASS reverse request decelerates to zero before DIR hold/setup and reverse acceleration");
  command(0,0,0,0,0,200,200);assert(Motor_OutputStopped());step(50);assert(Motor_OutputStopped());
  puts("PASS emergency STOP preempts the profile and cannot resume it");
  run(1500,1,1,0,1000,100);run(2600,3,0,0,1000,100);Motor_ProfileStatus(&s);assert(s.phase==MP_IDLE && s.hz==0 && Motor_OutputStopped());
  puts("PASS normal deceleration reaches zero while heartbeats continue");
  command(0,0,0,0,0,200,200);
- run(6000,1,50,0,200,200);Motor_ProfileStatus(&s);
- assert(s.phase==MP_CRUISE && s.hz==1091);
- assert(test_tim1.ARR==916 && test_tim1.CCR1==458);
- puts("PASS 50 percent reaches 1091 Hz command / 917 timer ticks with 200 Hz/s ramp");
+ run(11000,1,50,0,200,200);Motor_ProfileStatus(&s);
+ assert(s.phase==MP_CRUISE && s.hz==2081);
+ assert(test_tim1.ARR==480 && test_tim1.CCR1==240);
+ puts("PASS 50 percent reaches 2081 Hz command / 481 timer ticks with 200 Hz/s ramp");
  command(0,0,0,0,0,200,200);
  motion_profile_t m={0};assert(mp_command(&m,1,100,1,1000,1000,100,100,0));
  mp_tick(&m,2);mp_tick(&m,12);mp_tick(&m,1012);assert(m.phase==MP_CRUISE);
@@ -98,5 +114,19 @@ int main(void){
  m=(motion_profile_t){0};assert(mp_command(&m,1,100,1,1000,1000,100,100,0));mp_tick(&m,2);mp_tick(&m,12);mp_tick(&m,1012);
  assert(mp_command(&m,1,50,0,0,0,100,100,1012));assert(m.phase==MP_DECEL);mp_tick(&m,1512);assert(m.phase==MP_CRUISE && m.milli_hz==50000);
  puts("PASS mode and speed update cannot leave the previous cruise frequency latched");
+ for(unsigned pin=13;pin<=14;++pin){
+   run(4200,1,100,0,1000,1000);
+   Motor_ProfileStatus(&s);assert(s.hz==4000 && Motor_OutputActive());
+   Motor_TestLimitPins(UINT16_MAX & ~(1U << pin),true);
+   assert(Motor_OutputStopped() && !(test_tim1.CR1 & TIM_CR1_CEN));
+   assert(!Motor_ProfileCommand(1,100,0,0,0,1000,1000));
+   Motor_TestLimitPins(UINT16_MAX,false);
+   assert(!Motor_LimitTryReset());
+   step(100);
+   assert(Motor_LimitTryReset());
+   step(100);
+   assert(Motor_OutputStopped());
+ }
+ puts("PASS either STM32 limit cuts 4000 Hz output and reset never resumes it");
  return 0;
 }

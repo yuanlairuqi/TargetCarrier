@@ -28,6 +28,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 #include "ble_guard.h"
+#include "armor_can.h"
+#include "armor_wire.h"
 #include "now_radio.h"
 #include "now_session.h"
 #include "oled.h"
@@ -37,7 +39,7 @@ static const ble_uuid128_t svc_uuid=BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0x
 static const ble_uuid128_t cmd_uuid=BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x02,0x00,0x41,0x6e);
 static const ble_uuid128_t status_uuid=BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x03,0x00,0x41,0x6e);
 typedef struct {uint8_t data[17];uint32_t at,epoch;} item_t;
-static QueueHandle_t safety_q,cmd_q,gain_q,param_q;
+static QueueHandle_t safety_q,cmd_q,gain_q,param_q,armor_q;
 static SemaphoreHandle_t state_lock;
 static volatile uint16_t conn=BLE_HS_CONN_HANDLE_NONE;
 static volatile bool subscribed;
@@ -56,7 +58,7 @@ static uint32_t now_ms(void){return (uint32_t)(esp_timer_get_time()/1000);}
 static bool fresh(void){return have_status&&(uint32_t)(now_ms()-stm_at)<=300U;}
 static void put32(uint8_t *p,uint32_t v){for(int i=0;i<4;i++)p[i]=(uint8_t)(v>>(8*i));}
 static void put16(uint8_t *p,uint32_t v){if(v>65535)v=65535;p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
-static void clear_queues(void){xQueueReset(safety_q);xQueueReset(cmd_q);xQueueReset(gain_q);xQueueReset(param_q);}
+static void clear_queues(void){xQueueReset(safety_q);xQueueReset(cmd_q);xQueueReset(gain_q);xQueueReset(param_q);xQueueReset(armor_q);armor_can_cancel();}
 static void uart_send(const uint8_t f[17]){
     /* One UART sequence owner across PC reconnects and failsafe injections.
      * Format/flags/ARM token remain the existing STM32 protocol. */
@@ -81,9 +83,17 @@ static void notify(const void *data,size_t size){
     struct os_mbuf *om=ble_hs_mbuf_from_flat(data,size);
     if(om){int rc=ble_gatts_notify_custom(c,status_handle,om);if(rc&&rc!=BLE_HS_ENOTCONN)++drops;}
 }
+static void publish_armor(const armor_result_t *result)
+{
+    uint8_t frame[17];
+    armor_encode_status(frame, result->result, result->color, result->ticket);
+    notify(frame, sizeof(frame));
+}
+
 static void health(uint8_t out[20]){
     memset(out,0,20);out[0]='T';out[1]='B';out[2]=1;
     bool f=fresh();out[3]=(guard.connected?1:0)|(f?2:0)|(guard.failsafe?4:0)|(guard.disarm_seen?8:0)|(guard.active?16:0);
+    out[3] |= ARMOR_SUPPORTED_FLAG | (armor_can_ready() ? ARMOR_READY_FLAG : 0);
     put32(out+4,boot_id);put32(out+8,epoch);
     put16(out+12,have_status?(uint32_t)(now_ms()-stm_at):65535);
     put16(out+14,have_motor?(uint32_t)(now_ms()-motor_at):65535);
@@ -112,6 +122,10 @@ static int access_cmd(uint16_t c,uint16_t a,struct ble_gatt_access_ctxt *ctxt,vo
             xQueueReset(cmd_q);xQueueOverwrite(safety_q,&item);
         }else xQueueOverwrite(cmd_q,&item);
     }else if(item.data[2]==PROTO_MSG_GAINS)xQueueOverwrite(gain_q,&item);
+    else if(item.data[2]==ARMOR_SET){
+        item.at=now_ms(); /* Accepted only after acquiring the bridge lock. */
+        xQueueOverwrite(armor_q,&item);
+    }
     else if(xQueueSend(param_q,&item,0)!=pdTRUE)++drops;
     xSemaphoreGive(state_lock);
     return 0; /* transport accepted, execution is confirmed only by STM32 data */
@@ -154,10 +168,44 @@ static bool record_send(const uint8_t fragment[20],void *ctx){
  (void)ctx;uint8_t out[64]={'W','N',1,4};record_put(out+4,2);record_put(out+8,boot_id);record_put(out+12,epoch);
  record_put(out+16,radio.session);out[32]=3;memcpy(out+40,fragment,20);record_put(out+60,now_crc32(out,60));return now_radio_send_wave(out);
 }
+/* CAN lamp commands and reports must be serviced before a potentially
+ * blocking I2C transaction. Session/epoch checks are still under state_lock. */
+static void service_armor(uint32_t now)
+{
+    armor_result_t report;
+    bool have_report = armor_can_poll(now, &report);
+    item_t lamp;
+    if ((!have_report || !report.ticket) &&
+        xQueueReceive(armor_q, &lamp, 0) == pdTRUE &&
+        lamp.epoch == epoch &&
+        (radio.active || conn != BLE_HS_CONN_HANDLE_NONE)) {
+        armor_result_t failure;
+        uint32_t ticket = armor_ticket(lamp.data + 5);
+        if (now - lamp.at > 300) {
+            failure = (armor_result_t){.ticket = ticket, .result = ARMOR_BUSY, .color = armor_can_color()};
+            report = failure;
+            have_report = true;
+        } else if (armor_can_request(lamp.data[4], ticket, now, &failure)) {
+            report = failure;
+            have_report = true;
+        }
+    }
+    static uint32_t last_lamp_status;
+    if (have_report) {
+        publish_armor(&report);
+        last_lamp_status = now;
+    } else if ((radio.active || subscribed) && now - last_lamp_status >= 2000) {
+        report = (armor_result_t){.result = ARMOR_OBSERVED, .color = armor_can_color()};
+        publish_armor(&report);
+        last_lamp_status = now;
+    }
+}
+
 static void worker(void *arg){
     (void)arg;uint32_t seen_epoch=0,last_byte=0;uint8_t last_status_seq=0,last_motor_seq=0;
     for(;;){
-        uint32_t now=now_ms();xSemaphoreTake(state_lock,portMAX_DELAY);
+        xSemaphoreTake(state_lock,portMAX_DELAY);
+        uint32_t now=now_ms();
         if(seen_epoch!=epoch){seen_epoch=epoch;guard_connected=radio.active||conn!=BLE_HS_CONN_HANDLE_NONE;tb_guard_connection(&guard,guard_connected);inject_stop(now);}
         now_radio_stats_t rs;now_radio_stats(&rs);
         if(radio.active&&((uint32_t)(now-radio.last)>=600U||radio_generation!=rs.recoveries)){
@@ -172,12 +220,17 @@ static void worker(void *arg){
                 result=tn_accept(&radio,&q,boot_id,epoch,at,now);
                 if(result==NOW_OK){
                     if(!was_active){clear_queues();tb_guard_connection(&guard,true);}
-                    if(tb_guard_accept(&guard,q.command,now,fresh()))uart_send(q.command);
+                    if(q.command[2]==ARMOR_SET){
+                        item_t lamp={.at=at,.epoch=epoch};
+                        memcpy(lamp.data,q.command,sizeof(lamp.data));
+                        xQueueOverwrite(armor_q,&lamp);
+                    }else if(tb_guard_accept(&guard,q.command,now,fresh()))uart_send(q.command);
                     else{if(radio_stop(q.command))inject_stop(now);result=NOW_BAD_COMMAND;}
                 }else if(result==NOW_REPLAY&&radio_stop(q.command))inject_stop(now);
             }
             uint8_t h[20];health(h);radio_publish(h,20,result,q.kind,q.kind==NOW_QUERY?radio.session:q.session,q.kind==NOW_QUERY?radio.seq:q.seq);
         }
+        service_armor(now_ms());
         uint8_t bytes[256],frame[17];int n=wl_esp_read(bytes,sizeof(bytes));
         if(rx.len&&(uint32_t)(now-last_byte)>20)lc_rx_overflow(&rx);
         for(int i=0;i<n;i++){
@@ -234,7 +287,10 @@ static void display_task(void *arg){
 }
 void app_main(void){
     esp_err_t rc=nvs_flash_init();if(rc==ESP_ERR_NVS_NO_FREE_PAGES||rc==ESP_ERR_NVS_NEW_VERSION_FOUND){ESP_ERROR_CHECK(nvs_flash_erase());rc=nvs_flash_init();}ESP_ERROR_CHECK(rc);
-    state_lock=xSemaphoreCreateMutex();safety_q=xQueueCreate(1,sizeof(item_t));cmd_q=xQueueCreate(1,sizeof(item_t));gain_q=xQueueCreate(1,sizeof(item_t));param_q=xQueueCreate(4,sizeof(item_t));assert(state_lock&&safety_q&&cmd_q&&gain_q&&param_q);
+    state_lock=xSemaphoreCreateMutex();safety_q=xQueueCreate(1,sizeof(item_t));cmd_q=xQueueCreate(1,sizeof(item_t));gain_q=xQueueCreate(1,sizeof(item_t));param_q=xQueueCreate(4,sizeof(item_t));
+    armor_q=xQueueCreate(1,sizeof(item_t));
+    assert(state_lock&&safety_q&&cmd_q&&gain_q&&param_q&&armor_q);
+    armor_can_init();
     tb_guard_init(&guard);lc_rx_init(&rx);boot_id=esp_random();if(!boot_id)boot_id=1;cap_source_init(&recording_source,2,boot_id);
     if(!wl_esp_init())return; /* I2C owns STM32 communication; no UART driver installed. */
     radio_available=now_radio_init();(void)radio_available;

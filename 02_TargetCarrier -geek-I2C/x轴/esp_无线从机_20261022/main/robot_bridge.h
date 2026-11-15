@@ -7,9 +7,10 @@
 #define BRIDGE_PING_MS 200
 enum { BRIDGE_OK=0, BRIDGE_OFFLINE=6, BRIDGE_REJECTED=7, BRIDGE_TX_ERROR=8, BRIDGE_ACK_TIMEOUT=9 };
 typedef struct {
-    uint8_t protocol,peer_requested;
+    uint8_t protocol,peer_requested,output_status;
+    uint16_t output_hz;
     uint16_t accel,decel,current_hz,target_hz;
-    bool enabled, online, waiting, queued, sent, confirmed;
+    bool enabled, online, waiting, queued, sent, confirmed, reset_confirmed;
     uint32_t session, next_token, revision, sent_at, last_tx, last_rx;
     uint32_t completed_token, completed_phone, ack;
     uint8_t desired_motion, desired_speed, desired_mode, peer_mode, peer_phase, peer_motion, peer_speed, peer_flags, peer_error, error;

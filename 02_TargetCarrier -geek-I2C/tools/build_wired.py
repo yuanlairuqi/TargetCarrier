@@ -4,7 +4,7 @@ import os,sys,json,subprocess,shutil,hashlib
 import argparse
 parser=argparse.ArgumentParser(description='Build SPI/I2C business firmware, without device access')
 parser.add_argument('--out',type=Path,required=True)
-parser.add_argument('--target',choices=['all','stm','esp','master','ble','target-stm','target-esp'],default='all')
+parser.add_argument('--target',choices=['all','stm','esp','x-stm','x-esp','master','ble','target-stm','target-esp'],default='all')
 parser.add_argument('--sdk',type=Path,default=Path('C:/Users/y/.platformio/packages'))
 parser.add_argument('--paired',action='store_true')
 a=parser.parse_args();ROOT=Path(__file__).resolve().parents[1]
@@ -12,13 +12,22 @@ variant=json.loads((ROOT/'wired_transport/variant.json').read_text(encoding='utf
 W=a.out.resolve();S=W/'src'
 if W.exists() or not str(W).isascii() or W.is_relative_to(ROOT):parser.error('Choose a new ASCII output directory outside this project')
 if W.is_relative_to(Path('C:/Users/y/Desktop/TargetCarrier -统geek')):parser.error('Cannot write build outputs to the preserved baseline')
+vehicle = '靶车/靶车' if (ROOT/'靶车/靶车/firmware').is_dir() else '靶车'
 if a.paired:
- for f in (['靶车/靶车/firmware/esp32_bridge/ble_direct'] if kind.startswith('target-') else ['ESP32-S3-GEEK','x轴/esp_无线从机_20261022','靶车/靶车/firmware/esp32_bridge/ble_direct']):
+ selected = {
+  'all': ('ESP32-S3-GEEK','x轴/esp_无线从机_20261022',vehicle+'/firmware/esp32_bridge/ble_direct'),
+  'esp': ('x轴/esp_无线从机_20261022',vehicle+'/firmware/esp32_bridge/ble_direct'),
+  'x-esp': ('x轴/esp_无线从机_20261022',),
+  'master': ('ESP32-S3-GEEK',),
+  'target-esp': (vehicle+'/firmware/esp32_bridge/ble_direct',),
+ }
+ for f in selected.get(kind, ()):
   if not (ROOT/f/'pairing.local.defaults').is_file():parser.error('Actual pairing.local.defaults files are required for the selected nodes')
 W.mkdir(parents=True)
 skip=shutil.ignore_patterns('build','build-*','verification','_backups','__pycache__','.git','.vscode','sdkconfig','sdkconfig.old',*(() if a.paired else ('pairing.local.defaults',)))
-for origin,name in [('x轴/esp','xble'),('wired_transport','wired_transport'),('x轴/esp_无线从机_20261022','xesp'),('x轴/野火stm','xstm'),('靶车/靶车','vehicle'),('ESP32-S3-GEEK','master')]:
+for origin,name in [('x轴/esp','xble'),('wired_transport','wired_transport'),('x轴/esp_无线从机_20261022','xesp'),('x轴/野火stm','xstm'),(vehicle,'vehicle'),('ESP32-S3-GEEK','master')]:
  if kind.startswith('target-') and name not in ('wired_transport','vehicle'):continue
+ if kind in ('x-stm','x-esp') and name not in ('wired_transport',kind.replace('-','')):continue
  dest=S/name
  if not dest.exists():shutil.copytree(ROOT/origin,dest,ignore=skip)
 # -- current implementation snapshots are never mixed with original-project files.
@@ -32,15 +41,17 @@ def run(label,cmd):
  results.append({'label':label,'exit':r.returncode,'command':list(map(str,cmd))});resultfile.write_text(json.dumps(results,indent=2),encoding='utf8');print(variant,label,r.returncode,flush=True)
  if r.returncode:raise RuntimeError(str(log))
 wire='-DWIRED_TRANSPORT_ROOT='+str(S/'wired_transport')
-if kind in ('stm','all','target-stm'):
+if kind in ('stm','all','x-stm','target-stm'):
  if kind!='target-stm':
   run('xstm-configure',[cmake,'-S',S/'xstm','-B',W/'xstm','-G','Ninja','-DCMAKE_TOOLCHAIN_FILE='+str(S/'xstm/cmake/gcc-arm-none-eabi.cmake'),'-DCMAKE_BUILD_TYPE=Release',wire])
   run('xstm',[cmake,'--build',W/'xstm','--parallel','4'])
- src=S/'vehicle/firmware/stm32_f103'
- run('target-stm-configure',[cmake,'-S',src,'-B',W/'target-stm','-G','Ninja','-DCMAKE_TOOLCHAIN_FILE='+str(S/'vehicle/cmake/toolchain-stm32f103.cmake'),'-DPIO_PACKAGES_DIR='+str(sdk),wire])
- run('target-stm',[cmake,'--build',W/'target-stm','--parallel','4'])
-if kind in ('esp','all','master','ble','target-esp'):
+ if kind!='x-stm':
+  src=S/'vehicle/firmware/stm32_f103'
+  run('target-stm-configure',[cmake,'-S',src,'-B',W/'target-stm','-G','Ninja','-DCMAKE_TOOLCHAIN_FILE='+str(S/'vehicle/cmake/toolchain-stm32f103.cmake'),'-DPIO_PACKAGES_DIR='+str(sdk),wire])
+  run('target-stm',[cmake,'--build',W/'target-stm','--parallel','4'])
+if kind in ('esp','all','x-esp','master','ble','target-esp'):
  projects=[('xble',S/'xble')] if kind=='ble' else [('master',S/'master')] if kind=='master' else ([('master',S/'master')] if kind=='all' else [])+[('xble',S/'xble'),('xesp',S/'xesp'),('target-esp',S/'vehicle/firmware/esp32_bridge/ble_direct')]
+ if kind=='x-esp':projects=[('xesp',S/'xesp')]
  if kind=='target-esp':projects=[('target-esp',S/'vehicle/firmware/esp32_bridge/ble_direct')]
  for label,src in projects:
   b=W/label

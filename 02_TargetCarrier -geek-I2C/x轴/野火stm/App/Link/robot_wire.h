@@ -4,6 +4,19 @@
 #include <stddef.h>
 #include <stdint.h>
 #define WIRE_SIZE 32
+
+/* X STM->ESP STATUS payload[15]: marker, output direction, latch, live inputs.
+ * payload[16..17]: timer output Hz, little endian. Unused by older firmware.
+ * ESP->host v4 status byte 19: marker, latch, live inputs, phase (low nibble).
+ */
+enum {
+    X_LIMIT_LEFT = 1, X_LIMIT_RIGHT = 2, X_LIMIT_LATCHED = 4,
+    X_OUTPUT_PRESENT = 0x80, X_OUTPUT_DIR_SHIFT = 3, X_PEER_LIMIT = 5
+};
+#define X_RESET_ACCEL 0x4c52U
+#define X_RESET_DECEL 0xa55aU
+
+
 enum { WIRE_COMMAND=1, WIRE_STATUS=2, WIRE_PING=3, WIRE_PROFILE=4 };
 enum { PEER_READY=1, PEER_DEMO=2, PEER_BATTERY=4, PEER_APPLIED=8, PEER_LOCAL_BUSY=16, PEER_PROFILE=32 };
 typedef struct { uint8_t type; uint32_t session, token; uint8_t payload[18]; } wire_frame_t;

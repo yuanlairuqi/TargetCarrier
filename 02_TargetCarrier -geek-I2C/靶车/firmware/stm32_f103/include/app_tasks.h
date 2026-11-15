@@ -60,7 +60,6 @@ extern "C" {
 #define APP_CTRL_TIMEOUT_MS     300u   /* 无有效控制帧 -> 撤销授权并失能 */
 #define APP_CMD_MAX_AGE_MS      100u   /* 出队命令的允许年龄 */
 #define APP_FB_TIMEOUT_MS       200u   /* 使能时电机反馈超时 */
-#define APP_FB_GRACE_MS         1000u  /* 上电/清错后首次反馈宽限 */
 #define APP_CAN_RECOVER_THRESHOLD 64u  /* 连续发送失败 -> 请求恢复 */
 #define APP_CAN_RECOVER_PERIOD_MS 2000u
 #define APP_DISABLE_REPEAT       3u    /* 失能后补发帧数 (间隔约 2ms) */
