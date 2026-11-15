@@ -102,6 +102,8 @@ void app_main(void){
                 bool applied=lane==0?master_output_confirmed(body,last_command):
                     (body[24]==0&&body[25]==2&&wire_get32(body+16)==guard->session);
                 if(lane==1){guard->unlocked=guard->active&&applied;}
+                if(lane==0&&body[47]==10&&(body[59]&0xc0U)==0xc0U&&
+                   wire_get32(body+16)==guard->session)guard->unlocked=false;
                 if(guard->active&&last_command[25]==0&&applied)guard->unlocked=true;
                 portENTER_CRITICAL(&display_lock);
                 if(lane==0){output_ack=guard->active&&applied;speed=body[46];stm_online=(body[42]&8)!=0;}

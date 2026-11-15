@@ -120,6 +120,7 @@ bool dm_parse_feedback(uint8_t motor_id, const uint8_t *data, uint8_t len,
     fb->id        = id;
     fb->err       = err;
     fb->pos_rad   = dm_uint_to_float(p_int, -MOTOR_PMAX, MOTOR_PMAX, 16);
+    fb->pos_raw   = p_int;
     fb->vel_rad_s = dm_uint_to_float(v_int, -MOTOR_VMAX, MOTOR_VMAX, 12);
     fb->torque_nm = dm_uint_to_float(t_int, -MOTOR_TMAX, MOTOR_TMAX, 12);
     fb->temp_mos  = data[6];

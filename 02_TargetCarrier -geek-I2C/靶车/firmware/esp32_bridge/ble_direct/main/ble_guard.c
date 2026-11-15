@@ -1,4 +1,5 @@
 #include "ble_guard.h"
+#include "armor_wire.h"
 #include <string.h>
 static void safe(tb_guard_t *g){
     if(g->active)g->blocked_token=g->token;
@@ -8,6 +9,7 @@ void tb_guard_init(tb_guard_t *g){memset(g,0,sizeof(*g));g->failsafe=true;lc_seq
 void tb_guard_connection(tb_guard_t *g,bool connected){safe(g);g->connected=connected;g->have_pc=false;lc_seq_gate_init(&g->seq);}
 bool tb_frame_valid(const uint8_t *f,size_t size){
     if(!f||size!=17)return false;
+    if(f[2]==ARMOR_SET)return armor_valid_command(f);
     if(f[2]==PROTO_MSG_CTRL){ctrl_payload_t p;uint8_t seq;
         if(!proto_decode_ctrl(f,17,&p,&seq))return false;
         const int limit=(p.flags & CTRL_FLAG_VELOCITY)?(int)(MANUAL_YAW_MAX_DPS/PROTO_RATE_SCALE):1800;

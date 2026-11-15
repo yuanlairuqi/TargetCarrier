@@ -293,6 +293,13 @@ can_tx_done_t can_drv_poll_tx(void)
     return done;
 }
 
+bool can_drv_tx_idle(void)
+{
+    const uint32_t empty = CDRV_TSR_TME(0) | CDRV_TSR_TME(1) | CDRV_TSR_TME(2);
+    return (CAN1->TSR & empty) == empty &&
+           !s_mailbox_pending[0] && !s_mailbox_pending[1] && !s_mailbox_pending[2];
+}
+
 void can_drv_abort_all(void)
 {
     taskENTER_CRITICAL();

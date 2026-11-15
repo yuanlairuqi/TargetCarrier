@@ -1,6 +1,7 @@
 #ifndef MOCK_STM32F1XX_H
 #define MOCK_STM32F1XX_H
 #include <stdint.h>
+void NVIC_SystemReset(void);
 /* Minimal register double for driver logic; not a bus/timing simulator. */
 typedef struct {uint32_t TIR,TDTR,TDLR,TDHR;} MockTx;
 typedef struct {uint32_t RIR,RDTR,RDLR,RDHR;} MockRx;

@@ -22,7 +22,7 @@
  *      7    2    yaw_q   单圈朝向 = deg(-180..180) / 0.01，非机械行程限位。
  *                      v6.1 CTRL_FLAG_VELOCITY 时完全不参与偏航控制。
  *      9    2    pitch_q 俯仰角量化值  = deg(-90..90)   / PROTO_ANGLE_SCALE(0.01)  ->  -9000..9000
- *     11    2    yawrate 偏航速度量化值 = dps(-360..360) / PROTO_RATE_SCALE(0.1)   -> -3600..3600
+ *     11    2    yawrate 偏航速度量化值 = dps(-900..900) / PROTO_RATE_SCALE(0.1)   -> -9000..9000
  *     13    2    pitchrate 俯仰速度量化值
  *     15    1    crc16    = CRC16-Modbus(bytes[1..14]) 低 8 位
  *
@@ -404,8 +404,9 @@ static inline bool proto_decode_bridge_status(const uint8_t *in, uint16_t len,
  *     否则桥接自己的 seq 会顶掉主机后续的命令序号。
  *   - 旧固件会忽略该位 (只在旧 STM32 上会退化为普通 flags=0 帧), 线格式不变。 */
 #define CTRL_FLAG_VELOCITY        0x0040u  /* v6.1 MIT speed-only: kp=0, no position accumulation */
+#define CTRL_FLAG_MOTION          0x0080u  /* Explicit motion setpoint in the confirmed ARM session. */
 #define PROTO_CAPABILITY_RID       254u
-#define PROTO_CAPABILITY_VALUE     0x00060101u
+#define PROTO_CAPABILITY_VALUE     0x00060102u
 #define CTRL_FLAG_FAILSAFE        0x0020u
 #define CTRL_FLAG_ARM_TOKEN_MASK  0xFF00u
 #define CTRL_FLAG_ARM_TOKEN_SHIFT 8u

@@ -13,6 +13,135 @@ static TIM_TypeDef *motor_timer;
 static uint32_t wait_started;
 static uint8_t continuous_direction;
 static uint32_t continuous_period;
+static volatile uint8_t limit_latched;
+static volatile bool release_tracking;
+static uint32_t release_at;
+#define LIMIT_RELEASE_MS 100U
+
+#define LIMIT_1_PIN (1U << 14) /* PB14 -> status bit 0 */
+#define LIMIT_2_PIN (1U << 13) /* PB13 -> status bit 1 */
+#define LIMIT_PINS (LIMIT_1_PIN | LIMIT_2_PIN)
+
+static uint8_t LimitLevelsFromPins(uint32_t high_pins) {
+  return (uint8_t)((!(high_pins & LIMIT_1_PIN) ? 1U : 0U) |
+                   (!(high_pins & LIMIT_2_PIN) ? 2U : 0U));
+}
+
+#ifndef MOTOR_HOST_TEST
+static uint32_t LockLimits(void) {
+  uint32_t mask = __get_PRIMASK();
+  __disable_irq();
+  return mask;
+}
+static void UnlockLimits(uint32_t mask) { __set_PRIMASK(mask); }
+static uint8_t LimitLevels(void) {
+  return LimitLevelsFromPins(GPIOB->IDR);
+}
+static bool LimitEdges(void) {
+  return (EXTI->PR & LIMIT_PINS) != 0U;
+}
+#else
+static uint16_t test_pins_high = UINT16_MAX;
+static uint32_t LockLimits(void) { return 0; }
+static void UnlockLimits(uint32_t mask) { (void)mask; }
+static uint8_t LimitLevels(void) { return LimitLevelsFromPins(test_pins_high); }
+static bool LimitEdges(void) { return false; }
+#endif
+
+/* IRQ path: cut TIM1 output directly; the control task clears the motion
+ * profile and queues. The IRQ neither calls the RTOS nor waits for I2C. */
+static void TripLimits(void) {
+  limit_latched = 1U;
+  release_tracking = false;
+  if (motor_timer != NULL) {
+    motor_timer->CR1 &= ~TIM_CR1_CEN;
+    motor_timer->CCMR1 = (motor_timer->CCMR1 & ~TIM_CCMR1_OC1M) |
+                         (4U << TIM_CCMR1_OC1M_Pos); /* OC1 forced inactive */
+    motor_timer->CNT = 0U;
+  }
+}
+
+#ifndef MOTOR_HOST_TEST
+void EXTI15_10_IRQHandler(void) {
+  uint32_t pending = EXTI->PR & LIMIT_PINS;
+  if (pending) {
+    EXTI->PR = pending;
+    TripLimits();
+  }
+}
+void Motor_LimitsInit(void) {
+  __HAL_RCC_AFIO_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  GPIO_InitTypeDef pins = {.Pin=LIMIT_PINS, .Mode=GPIO_MODE_IT_FALLING, .Pull=GPIO_PULLUP};
+  HAL_GPIO_Init(GPIOB, &pins);
+  (void)Motor_LimitStatus(); /* A low input may have no falling edge at boot. */
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 4, 0); /* Higher priority than I2C, no RTOS calls. */
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+#else
+void Motor_TestLimitPins(uint16_t high_pins, bool falling_edge) {
+  uint16_t previous = test_pins_high;
+  test_pins_high = high_pins;
+  if (falling_edge && (previous & ~test_pins_high & LIMIT_PINS)) TripLimits();
+}
+#endif
+
+static uint8_t SampleLimits(void) {
+  uint8_t levels = LimitLevels();
+  if (levels || LimitEdges()) TripLimits();
+  else if (!release_tracking) {
+    release_at = HAL_GetTick();
+    release_tracking = true;
+  }
+  return levels;
+}
+
+uint8_t Motor_LimitStatus(void) {
+  uint32_t mask = LockLimits();
+  uint8_t levels = SampleLimits();
+  uint8_t flags = levels | (limit_latched ? 4U : 0U);
+  UnlockLimits(mask);
+  return flags;
+}
+
+bool Motor_LimitTryReset(void) {
+  Motor_Stop(); /* Discard the old command even when reset is denied. */
+  uint32_t mask = LockLimits();
+  uint8_t levels = SampleLimits();
+  bool allowed = !levels && release_tracking && Motor_OutputStopped() &&
+                 (uint32_t)(HAL_GetTick()-release_at) >= LIMIT_RELEASE_MS;
+  if (allowed) limit_latched = 0;
+  UnlockLimits(mask);
+  return allowed;
+}
+
+/* Serialize the only timer start with EXTI. A pending edge blocks start even
+ * if the pin has already bounced high and its IRQ has not run yet. */
+static bool StartPulse(void) {
+  uint32_t mask = LockLimits();
+  (void)SampleLimits();
+  bool allowed = !limit_latched;
+  if (allowed) {
+    motor_timer->CCER |= TIM_CCER_CC1E;
+    motor_timer->BDTR |= TIM_BDTR_MOE;
+    motor_timer->CR1 |= TIM_CR1_CEN;
+  } else {
+    TripLimits();
+  }
+  UnlockLimits(mask);
+  return allowed;
+}
+
+static void UpdatePeriod(uint32_t period) {
+  uint32_t mask = LockLimits();
+  if (!limit_latched) {
+    motor_timer->CR1 |= TIM_CR1_UDIS;
+    motor_timer->ARR = period - 1U;
+    motor_timer->CCR1 = period / 2U;
+    motor_timer->CR1 &= ~TIM_CR1_UDIS;
+  }
+  UnlockLimits(mask);
+}
 
 MOTOR_STATIC_ASSERT(MOTOR_DRIVER_PULSES_PER_REV > 0U, "Set a nonzero pulses/rev");
 MOTOR_STATIC_ASSERT(MOTOR_TARGET_ANGLE_MDEG <= 360000U, "Angle must be 0..360 degrees");
@@ -51,10 +180,10 @@ static void StartBatch(void)
   motor_timer->SR = 0U;
   g_motor_status.active_batch = count;
   g_motor_status.state = MOTOR_RUNNING;
-  motor_timer->CR1 |= TIM_CR1_CEN;
+  if (!StartPulse()) Motor_Stop();
 }
 
-void Motor_StartOnce(TIM_HandleTypeDef *timer)
+static void StartOnce(TIM_HandleTypeDef *timer)
 {
   if (g_motor_status.state != MOTOR_NOT_STARTED) {
     return;
@@ -105,8 +234,22 @@ void Motor_StartOnce(TIM_HandleTypeDef *timer)
   g_motor_status.state = MOTOR_WAITING;
 }
 
+void Motor_StartOnce(TIM_HandleTypeDef *timer)
+{
+  uint32_t mask = LockLimits();
+  StartOnce(timer);
+  UnlockLimits(mask);
+}
+
 void Motor_Process(void)
 {
+  if (Motor_LimitStatus() & 4U) {
+    if (profile.enabled || g_motor_status.state == MOTOR_CONTINUOUS_RUNNING ||
+        g_motor_status.state == MOTOR_CONTINUOUS_WAITING ||
+        g_motor_status.state == MOTOR_CONTINUOUS_HOLD || Motor_LocalBusy())
+      Motor_Stop();
+    return;
+  }
   if(profile.enabled){ProfileProcess();return;}
   if (g_motor_status.state == MOTOR_CONTINUOUS_HOLD) {
     if ((uint32_t)(HAL_GetTick() - wait_started) >= MOTOR_DIRECTION_HOLD_MS) {
@@ -131,14 +274,12 @@ void Motor_Process(void)
       motor_timer->CNT = 0U;
       motor_timer->EGR = TIM_EGR_UG;
       motor_timer->SR = 0U;
-      motor_timer->CCER |= TIM_CCER_CC1E;
-      motor_timer->BDTR |= TIM_BDTR_MOE;
       g_motor_status.state = MOTOR_CONTINUOUS_RUNNING;
-      motor_timer->CR1 |= TIM_CR1_CEN;
+      if (!StartPulse()) Motor_Stop();
     }
   } else if (g_motor_status.state == MOTOR_CONTINUOUS_RUNNING) {
     if ((motor_timer->CR1 & TIM_CR1_CEN) == 0U) {
-      g_motor_status.state = MOTOR_FAULT;
+      if (!(Motor_LimitStatus() & 4U)) g_motor_status.state = MOTOR_FAULT;
       Motor_Stop();
     }
   } else if (g_motor_status.state == MOTOR_WAITING) {
@@ -212,7 +353,7 @@ bool Motor_HasFault(void)
 bool Motor_ContinuousReady(void)
 {
   return MOTOR_CONTINUOUS_ENABLED != 0U && motor_timer != NULL &&
-         g_motor_status.state != MOTOR_FAULT;
+         g_motor_status.state != MOTOR_FAULT && !(Motor_LimitStatus() & 4U);
 }
 
 bool Motor_OutputActive(void)
@@ -248,10 +389,7 @@ bool Motor_SetContinuous(uint8_t direction, uint8_t speed_percent)
         g_motor_status.state == MOTOR_CONTINUOUS_RUNNING) {
       /* Prevent update between the paired preload writes. No forced UG,
        * no counter reset: both values take effect on a later natural update. */
-      motor_timer->CR1 |= TIM_CR1_UDIS;
-      motor_timer->ARR = period - 1U;
-      motor_timer->CCR1 = period / 2U;
-      motor_timer->CR1 &= ~TIM_CR1_UDIS;
+      UpdatePeriod(period);
     }
     continuous_period = period;
     return true; /* same direction does not restart its direction delay */
@@ -287,7 +425,7 @@ static void ProfileDisable(void){
  motor_timer->CNT=0;applied_hz=0;
 }
 static void ProfileProcess(void){
- if(applied_hz && !Motor_OutputActive()){Motor_Stop();g_motor_status.state=MOTOR_FAULT;return;}
+ if(applied_hz && !Motor_OutputActive()){Motor_Stop();if(!(Motor_LimitStatus()&4U))g_motor_status.state=MOTOR_FAULT;return;}
  mp_tick(&profile,HAL_GetTick());
  uint32_t hz=(uint32_t)(profile.milli_hz/1000U);
  bool run=(profile.phase==MP_ACCEL || profile.phase==MP_CRUISE || profile.phase==MP_DECEL) && hz>=MOTOR_RAMP_FIRST_HZ;
@@ -310,9 +448,9 @@ static void ProfileProcess(void){
    motor_timer->CCMR1=(motor_timer->CCMR1&~TIM_CCMR1_OC1M)|TIM_OCMODE_PWM2|TIM_CCMR1_OC1PE;
    motor_timer->PSC=MOTOR_TIMER_PRESCALER;motor_timer->ARR=period-1;motor_timer->CCR1=period/2;
    motor_timer->RCR=0;motor_timer->CNT=0;motor_timer->EGR=TIM_EGR_UG;motor_timer->SR=0;
-   motor_timer->CCER|=TIM_CCER_CC1E;motor_timer->BDTR|=TIM_BDTR_MOE;motor_timer->CR1|=TIM_CR1_CEN;
+   if(!StartPulse()){Motor_Stop();return;}
  }else if(hz!=applied_hz){
-   motor_timer->CR1|=TIM_CR1_UDIS;motor_timer->ARR=period-1;motor_timer->CCR1=period/2;motor_timer->CR1&=~TIM_CR1_UDIS;
+   UpdatePeriod(period);
  }
  applied_hz=hz;g_motor_status.state=MOTOR_CONTINUOUS_RUNNING;
 }
@@ -325,7 +463,27 @@ bool Motor_ProfileCommand(uint8_t op,uint8_t speed,uint8_t mode,uint32_t forward
  return mp_command(&profile,op,hz,mode,forward,reverse,accel,decel,HAL_GetTick());
 }
 void Motor_ProfileStatus(MotorProfileStatus *out){
- out->hz=(uint16_t)applied_hz;out->target_hz=profile.soft_stop?0:profile.target_hz;
- out->direction=applied_hz?applied_direction:0;out->phase=profile.phase;
+ out->hz=Motor_OutputActive()?(uint16_t)applied_hz:0;out->target_hz=profile.soft_stop?0:profile.target_hz;
+ out->direction=out->hz?applied_direction:0;out->phase=profile.phase;
  out->requested=profile.requested;out->active=profile.enabled && profile.phase!=MP_IDLE;
+}
+
+/* Frequency is the timer setting (ARR/PSC), with no electrical/encoder sample.
+ * A preload update may take effect on the next timer period. */
+uint8_t Motor_OutputSnapshot(uint16_t *hz, uint8_t *direction) {
+  uint32_t mask = LockLimits();
+  uint8_t flags = SampleLimits() | (limit_latched ? 4U : 0U);
+  *hz = 0;
+  *direction = 0;
+  if (!(flags & 4U) && motor_timer != NULL &&
+      (motor_timer->CR1 & TIM_CR1_CEN) && (motor_timer->CCER & TIM_CCER_CC1E) &&
+      (motor_timer->BDTR & TIM_BDTR_MOE) &&
+      (motor_timer->CCMR1 & TIM_CCMR1_OC1M) == TIM_OCMODE_PWM2) {
+    uint32_t divisor = (motor_timer->PSC + 1U) * (motor_timer->ARR + 1U);
+    *hz = (uint16_t)((MOTOR_TIMER_INPUT_HZ + divisor/2U) / divisor);
+    *direction = profile.enabled ? applied_direction :
+        g_motor_status.state == MOTOR_RUNNING ? 1U : continuous_direction;
+  }
+  UnlockLimits(mask);
+  return flags;
 }

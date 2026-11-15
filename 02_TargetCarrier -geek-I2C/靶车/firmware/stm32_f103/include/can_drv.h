@@ -76,6 +76,9 @@ bool can_drv_is_recovering(void);
  */
 can_tx_done_t can_drv_poll_tx(void);
 
+/** With the TX lock held, all submitted mailboxes have completed and been polled. */
+bool can_drv_tx_idle(void);
+
 /** 尝试取出一帧收到的报文 (从 FIFO0) */
 bool can_drv_receive(can_frame_t *out);
 
