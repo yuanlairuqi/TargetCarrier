@@ -1,0 +1,1118 @@
+--- a/02_TargetCarrier -geek-I2C/靶车/CMakeLists.txt
++++ b/02_TargetCarrier -geek-I2C/靶车/CMakeLists.txt
+@@ -102,6 +102,23 @@
+ endif()
+ add_test(NAME can_driver_regression COMMAND test_can_driver)
+ 
++# Compile the real controller with mocked I/O. GNU whole-program linking drops
++# hardware tasks that the host test does not start.
++if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
++    add_executable(test_reenable
++        firmware/stm32_f103/test/test_reenable.c
++        firmware/stm32_f103/src/dm_motor.c
++        "${PROTOCOL_DIR}/protocol.c"
++        "${LINKCORE_DIR}/lc_guard.c"
++        "${LINKCORE_DIR}/lc_can_tx.c")
++    target_include_directories(test_reenable PRIVATE
++        firmware/stm32_f103/test/mocks firmware/stm32_f103/include
++        firmware/lib/oled "${PROTOCOL_DIR}" "${LINKCORE_DIR}/include")
++    target_compile_options(test_reenable PRIVATE -O2 -flto -fwhole-program -UNDEBUG -Wall -Wextra)
++    target_link_options(test_reenable PRIVATE -flto -fwhole-program)
++    target_link_libraries(test_reenable PRIVATE m)
++    add_test(NAME reenable_can_regression COMMAND test_reenable)
++endif()
+ 
+ # =============================================================================
+ #  2. 三个交叉固件
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/lib/protocol/protocol.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/lib/protocol/protocol.h
+@@ -404,8 +404,9 @@
+  *     否则桥接自己的 seq 会顶掉主机后续的命令序号。
+  *   - 旧固件会忽略该位 (只在旧 STM32 上会退化为普通 flags=0 帧), 线格式不变。 */
+ #define CTRL_FLAG_VELOCITY        0x0040u  /* v6.1 MIT speed-only: kp=0, no position accumulation */
++#define CTRL_FLAG_MOTION          0x0080u  /* Explicit motion setpoint in the confirmed ARM session. */
+ #define PROTO_CAPABILITY_RID       254u
+-#define PROTO_CAPABILITY_VALUE     0x00060101u
++#define PROTO_CAPABILITY_VALUE     0x00060102u
+ #define CTRL_FLAG_FAILSAFE        0x0020u
+ #define CTRL_FLAG_ARM_TOKEN_MASK  0xFF00u
+ #define CTRL_FLAG_ARM_TOKEN_SHIFT 8u
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/app_tasks.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/app_tasks.h
+@@ -60,7 +60,6 @@
+ #define APP_CTRL_TIMEOUT_MS     300u   /* 无有效控制帧 -> 撤销授权并失能 */
+ #define APP_CMD_MAX_AGE_MS      100u   /* 出队命令的允许年龄 */
+ #define APP_FB_TIMEOUT_MS       200u   /* 使能时电机反馈超时 */
+-#define APP_FB_GRACE_MS         1000u  /* 上电/清错后首次反馈宽限 */
+ #define APP_CAN_RECOVER_THRESHOLD 64u  /* 连续发送失败 -> 请求恢复 */
+ #define APP_CAN_RECOVER_PERIOD_MS 2000u
+ #define APP_DISABLE_REPEAT       3u    /* 失能后补发帧数 (间隔约 2ms) */
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/can_drv.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/can_drv.h
+@@ -76,6 +76,9 @@
+  */
+ can_tx_done_t can_drv_poll_tx(void);
+ 
++/** With the TX lock held, all submitted mailboxes have completed and been polled. */
++bool can_drv_tx_idle(void);
++
+ /** 尝试取出一帧收到的报文 (从 FIFO0) */
+ bool can_drv_receive(can_frame_t *out);
+ 
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/dm_motor.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/dm_motor.h
+@@ -64,6 +64,7 @@
+     float   torque_nm;
+     uint8_t temp_mos;
+     uint8_t temp_coil;
++    uint16_t pos_raw;     /* Exact position code for an MIT hold target. */
+ } dm_feedback_t;
+ 
+ /* ---- 编解码 (纯函数, 便于主机端单元测试) ---- */
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/gimbal_motion.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/include/gimbal_motion.h
+@@ -10,6 +10,9 @@
+ static inline float gm_nearest(float angle,float reference,float pmax){
+     const float turn=6.28318530718f;
+     float p=angle+roundf((reference-angle)/turn)*turn;
++    /* The host orientation is quantized to 0.01 degree. Clip a rounding
++     * overshoot at a mapping endpoint before trying another turn. */
++    if (fabsf(p) <= pmax + 0.0001f) return gm_clip(p,-pmax,pmax);
+     while(p>pmax)p-=turn;
+     while(p< -pmax)p+=turn;
+     return gm_clip(p,-pmax,pmax);
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/app_main.c
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/app_main.c
+@@ -48,7 +48,12 @@
+ #define RAD2DEG  (180.0f / (float)M_PI)
+ 
+ #define GAIN_RAMP_STEPS   500u    /* 500 步 @1kHz = 500ms 使能斜坡 */
+-#define GAIN_RAMP_DOWN    5u      /* 失能斜坡: 每 ms 减 5 步 -> 100ms 收敛 */
++#define ARM_FB_MAX_AGE_MS 50u
++#define ARM_TIMEOUT_MS    200u
++#define ARM_STOP_SPEED    0.05f    /* rad/s, same stop criterion as the host */
++#define ARM_HOLD_ERROR    0.02f    /* rad, reject movement or a mapping discontinuity during hold */
++#define ARM_HOLD_KP_MAX   10.0f
++#define ARM_HOLD_KD_MAX   1.0f
+ 
+ #define CTRL_TICK_HZ      1000u
+ 
+@@ -109,8 +114,10 @@
+     float    torque_nm;
+     uint8_t  temp_mos;
+     uint8_t  err;
++    uint16_t pos_raw;
+     bool     valid;
+     uint32_t ms;
++    uint32_t sample;
+ } fb_state_t;
+ 
+ static fb_state_t g_fb;
+@@ -128,6 +135,16 @@
+ static volatile uint32_t g_link_drop_cmds = 0;    /* link: 队列满/解析丢弃 */
+ 
+ /* ctrl 任务私有状态 */
++typedef enum {
++    ARM_IDLE,
++    ARM_PRIME,
++    ARM_PRIME_SENT,
++    ARM_ENABLE,
++    ARM_ENABLE_SENT,
++    ARM_CONFIRM,
++    ARM_ACTIVE,
++} arm_phase_t;
++
+ static uint16_t s_target_flags = 0;
+ static float    s_target_pos_rad = 0.0f;
+ static float    s_target_vel_rad_s = 0.0f;
+@@ -138,7 +155,15 @@
+ static float    s_kp_now = 0.0f;
+ static float    s_kd_now = 0.0f;
+ static uint16_t s_ramp = 0;
+-static bool     s_enabled = false;
++static arm_phase_t s_arm_phase;
++static uint32_t s_arm_started;
++static uint32_t s_arm_confirmed_at;
++static uint32_t s_arm_fb_sample;
++static uint32_t s_disable_fb_sample;
++static uint16_t s_hold_raw;
++static float    s_hold_pos_rad;
++static bool     s_motion_requested;
++static lc_seq_gate_t s_applied_ctrl;
+ static bool     s_estop = false;
+ static bool     s_fault = false;
+ static bool     s_link_lost = true;
+@@ -146,7 +171,6 @@
+ static uint32_t s_arm_reject_seen = 0;
+ static uint32_t s_fail_streak = 0;
+ static uint32_t s_prev_submit_fail = 0;
+-static uint32_t s_fb_grace_until_ms = APP_FB_GRACE_MS;
+ static uint32_t s_fault_mask_until_ms = 0;   /* 清错后忽略旧故障码的窗口 */
+ static uint32_t s_seen_failsafe = 0;
+ static uint32_t s_seen_recover = 0;
+@@ -198,8 +222,10 @@
+     g_fb.torque_nm = fb->torque_nm;
+     g_fb.temp_mos  = fb->temp_mos;
+     g_fb.err       = fb->err;
++    g_fb.pos_raw   = fb->pos_raw;
+     g_fb.valid     = true;
+     g_fb.ms        = now_ms();
++    g_fb.sample++;
+     taskEXIT_CRITICAL();
+ }
+ 
+@@ -222,6 +248,15 @@
+ 
+ static void can_submit_disable(void)
+ {
++    fb_state_t fb;
++    fb_read(&fb);
++    s_disable_fb_sample = fb.sample;
++    s_arm_phase = ARM_IDLE;
++    s_motion_requested = false;
++    s_target_pos_rad = fb.valid ? fb.pos_rad : 0.0f;
++    s_target_vel_rad_s = 0.0f;
++    gm_reset(&s_motion, s_target_pos_rad);
++    s_ramp = 0;
+     s_abort_mailboxes = true; /* Also cancel old ENABLE/motion already in hardware. */
+     uint8_t d[8];
+     uint32_t id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_DISABLE, d);
+@@ -231,12 +266,12 @@
+     s_disable_sent = 1;
+ }
+ 
+-static void can_submit_enable(void)
+-{
+-    s_need_disable_burst = false;
+-    uint8_t d[8];
+-    uint32_t id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_ENABLE, d);
+-    can_request_safety(LC_CAN_SAFETY_ENABLE, id, d);
++static void reject_arm(void)
++{
++    lc_arm_force_safe(&s_arm);
++    s_arm.arm_reject++;
++    s_target_flags &= (uint16_t)~CTRL_FLAG_ENABLE;
++    can_submit_disable();
+ }
+ 
+ static void can_submit_clear_err(void)
+@@ -327,24 +362,11 @@
+ 
+ static void apply_command(const lc_cmd_t *cmd, uint32_t now)
+ {
+-    ctrl_target_t t;
+-    ctrl_payload_t pl;
+-    memset(&pl, 0, sizeof(pl));
+-    pl.flags       = cmd->flags;
+-    pl.mode        = cmd->mode;
+-    pl.yaw_q       = cmd->yaw_q;
+-    pl.pitch_q     = cmd->pitch_q;
+-    pl.yawrate_q   = cmd->yawrate_q;
+-    pl.pitchrate_q = cmd->pitchrate_q;
+-    proto_payload_to_target(&pl, &t);
+-
+-    /* Orientation only; continuous speed ignores position entirely. */
+-    float yaw_deg = t.yaw_deg;
+-    float pitch_deg = clampf(t.pitch_deg, GIMBAL_PITCH_MIN_DEG, GIMBAL_PITCH_MAX_DEG);
+-    (void)pitch_deg;   /* 单轴云台: 俯仰暂不驱动 */
+-
+-    s_target_pos_rad   = clampf(yaw_deg * DEG2RAD, -MOTOR_PMAX, MOTOR_PMAX);
+-    s_target_vel_rad_s = clampf(t.yaw_rate_dps * DEG2RAD, -MOTOR_VMAX, MOTOR_VMAX);
++    /* STOP can jump the command queue. Never apply a control frame older
++     * than the safety frame just applied. */
++    if (!lc_seq_accept(&s_applied_ctrl, cmd->seq)) {
++        return;
++    }
+ 
+     /* ---- 急停 ---- */
+     if (cmd->flags & CTRL_FLAG_ESTOP) {
+@@ -364,7 +386,6 @@
+         can_submit_clear_err();
+         s_fault = false;
+         s_fail_streak = 0;
+-        s_fb_grace_until_ms = now + APP_FB_GRACE_MS;
+         /* 电机下一帧反馈里可能还带着旧的故障码, 500ms 内不据此重新置故障,
+          * 否则"清错"永远清不掉 (旧实现也有这个问题)。 */
+         s_fault_mask_until_ms = now + 500u;
+@@ -376,18 +397,38 @@
+ 
+     /* ---- 授权状态机 ---- */
+     bool was_armed = s_arm.armed;
++    bool requesting_enable = (cmd->flags & (CTRL_FLAG_ENABLE | CTRL_FLAG_ARM)) ==
++                             (CTRL_FLAG_ENABLE | CTRL_FLAG_ARM);
++    bool motion = (cmd->flags & CTRL_FLAG_MOTION) != 0u;
++    uint8_t token = proto_flags_token(cmd->flags);
++    if (requesting_enable && ((was_armed && token != s_arm.last_token) ||
++                              (motion && (s_arm_phase != ARM_ACTIVE ||
++                                          (int32_t)(cmd->rx_ms - s_arm_confirmed_at) <= 0)))) {
++        return;
++    }
+     bool now_armed = lc_arm_update(&s_arm, cmd->flags);
+-    if (now_armed && !was_armed) {
+-        can_submit_enable();
+-    } else if (!now_armed && was_armed) {
++    if (!now_armed && was_armed) {
+         can_submit_disable();
+-        lc_can_tx_clear_motion(&s_can_tx);
+     }
+     if (s_arm.arm_reject > s_arm_reject_seen) {
+         s_arm_reject_seen = s_arm.arm_reject;
+     }
+ 
+-    s_target_flags = cmd->flags;
++    if (!now_armed) {
++        s_target_flags = (uint16_t)(cmd->flags & (uint16_t)~CTRL_FLAG_ENABLE);
++    } else if (motion) {
++        if (!s_motion_requested) {
++            s_ramp = 0;
++        }
++        s_target_flags = cmd->flags;
++        s_target_pos_rad = clampf((float)cmd->yaw_q * PROTO_ANGLE_SCALE * DEG2RAD,
++                                  -MOTOR_PMAX, MOTOR_PMAX);
++        s_target_vel_rad_s = clampf((float)cmd->yawrate_q * PROTO_RATE_SCALE * DEG2RAD,
++                                    -MOTOR_VMAX, MOTOR_VMAX);
++        s_motion_requested = true;
++    } else if (!s_motion_requested) {
++        s_target_flags = (uint16_t)(cmd->flags & (uint16_t)~CTRL_FLAG_VELOCITY);
++    }
+ }
+ 
+ /* ================================================================== */
+@@ -407,6 +448,43 @@
+         *age_out = age;
+     }
+     return age <= APP_FB_TIMEOUT_MS;
++}
++
++static void ctrl_service_arm_can(can_tx_done_t done)
++{
++    if (s_arm_phase == ARM_PRIME_SENT || s_arm_phase == ARM_ENABLE_SENT) {
++        /* These frames use an otherwise empty CAN TX pipeline, so the
++         * hardware completion belongs to the frame we sent. */
++        if (done.failed) {
++            reject_arm();
++        } else if (done.ok) {
++            if (s_arm_phase == ARM_PRIME_SENT) {
++                s_arm_phase = ARM_ENABLE;
++            } else {
++                fb_state_t fb;
++                fb_read(&fb);
++                s_arm_fb_sample = fb.sample;
++                s_arm_phase = ARM_CONFIRM;
++            }
++        }
++        return;
++    }
++    if (!can_drv_tx_idle()) {
++        return;
++    }
++    uint8_t data[8];
++    uint32_t id;
++    if (s_arm_phase == ARM_PRIME) {
++        dm_mit_cmd_t neutral = {0};
++        id = dm_pack_mit(MOTOR_CAN_ID, &neutral, data);
++        data[0] = (uint8_t)(s_hold_raw >> 8);
++        data[1] = (uint8_t)s_hold_raw;
++    } else {
++        id = dm_pack_special(MOTOR_CAN_ID, DM_MODE_MIT, DM_CMD_ENABLE, data);
++    }
++    if (can_drv_send(id, data, sizeof(data))) {
++        s_arm_phase = s_arm_phase == ARM_PRIME ? ARM_PRIME_SENT : ARM_ENABLE_SENT;
++    }
+ }
+ 
+ static void ctrl_service_can(uint32_t now)
+@@ -421,12 +499,16 @@
+             can_drv_abort_all();
+             s_abort_mailboxes = false;
+         }
+-        for (uint8_t i = 0; i < 3u; ++i) {
+-            const lc_can_frame_t *f = lc_can_tx_peek(&s_can_tx);
+-            if (f == NULL) break;
+-            bool ok = can_drv_send(f->id, f->data, f->len);
+-            lc_can_tx_pop(&s_can_tx, ok);
+-            if (!ok) break;
++        if (s_arm_phase >= ARM_PRIME && s_arm_phase <= ARM_ENABLE_SENT) {
++            ctrl_service_arm_can(done);
++        } else {
++            for (uint8_t i = 0; i < 3u; ++i) {
++                const lc_can_frame_t *f = lc_can_tx_peek(&s_can_tx);
++                if (f == NULL) break;
++                bool ok = can_drv_send(f->id, f->data, f->len);
++                lc_can_tx_pop(&s_can_tx, ok);
++                if (!ok) break;
++            }
+         }
+         can_drv_unlock();
+     }
+@@ -483,10 +565,8 @@
+     /* ---- 电机反馈看门狗: 使能中 200ms 无反馈 -> 故障失能 ---- */
+     fb_state_t fb;
+     fb_read(&fb);
+-    uint32_t age = 0;
+-    bool fresh = fb_is_fresh(&fb, now, &age);
+-    bool grace = (int32_t)(now - s_fb_grace_until_ms) < 0;
+-    if (s_enabled && !fresh && !grace) {
++    bool fresh = fb_is_fresh(&fb, now, NULL);
++    if (s_arm_phase != ARM_IDLE && !fresh) {
+         s_fault = true;
+         lc_arm_force_safe(&s_arm);
+         s_target_flags &= (uint16_t)~CTRL_FLAG_ENABLE;
+@@ -506,6 +586,47 @@
+     }
+ }
+ 
++static void ctrl_update_arm(const fb_state_t *fb, uint32_t now)
++{
++    if (!lc_arm_armed(&s_arm)) {
++        return;
++    }
++    const bool feedback_ok = fb->valid && lc_elapsed_ms(now, fb->ms) <= ARM_FB_MAX_AGE_MS;
++    const bool stopped = feedback_ok && fabsf(fb->vel_rad_s) <= ARM_STOP_SPEED;
++    if (s_estop || s_fault || s_link_lost || can_drv_is_recovering() || !can_drv_is_healthy()) {
++        reject_arm();
++    } else if (s_arm_phase == ARM_IDLE) {
++        if (!stopped || fb->err != 0u || fb->sample == s_disable_fb_sample ||
++            s_need_disable_burst || s_abort_mailboxes || s_can_tx.safety_pending[LC_CAN_SAFETY_DISABLE]) {
++            reject_arm();
++            return;
++        }
++        s_hold_pos_rad = fb->pos_rad;
++        s_hold_raw = fb->pos_raw;
++        s_target_pos_rad = fb->pos_rad;
++        s_target_vel_rad_s = 0.0f;
++        s_motion_requested = false;
++        s_ramp = 0;
++        gm_reset(&s_motion, fb->pos_rad);
++        lc_can_tx_clear_motion(&s_can_tx);
++        s_arm_started = now;
++        s_arm_phase = ARM_PRIME;
++    } else if (s_arm_phase != ARM_ACTIVE) {
++        if (!stopped || fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR ||
++            lc_elapsed_ms(now, s_arm_started) >= ARM_TIMEOUT_MS ||
++            (fb->err != 0u && (s_arm_phase < ARM_ENABLE_SENT || fb->err != 1u))) {
++            reject_arm();
++        } else if (s_arm_phase == ARM_CONFIRM && fb->err == 1u &&
++                   fb->sample != s_arm_fb_sample) {
++            s_arm_confirmed_at = now;
++            s_arm_phase = ARM_ACTIVE;
++        }
++    } else if (fb->err != 1u ||
++               (!s_motion_requested && (!stopped || fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR))) {
++        reject_arm();
++    }
++}
++
+ static void ctrl_step(uint32_t now)
+ {
+     /* ---- 1. 命令: 安全命令优先, 其余按到达顺序 (带 100ms 有效期) ---- */
+@@ -525,9 +646,11 @@
+     /* ---- 2. 增益帧 ---- */
+     gain_msg_t gm;
+     while (xQueueReceive(s_gain_q, &gm, 0) == pdTRUE) {
+-        s_target_kp = clampf(gm.kp, MOTOR_KP_MIN, MOTOR_KP_MAX);
+-        s_target_kd = clampf(gm.kd, MOTOR_KD_MIN, MOTOR_KD_MAX);
+-        s_gains_rx++;
++        if (s_arm_phase == ARM_IDLE) {
++            s_target_kp = clampf(gm.kp, MOTOR_KP_MIN, MOTOR_KP_MAX);
++            s_target_kd = clampf(gm.kd, MOTOR_KD_MIN, MOTOR_KD_MAX);
++            s_gains_rx++;
++        }
+     }
+ 
+     /* ---- 3. 参数请求 (低优先级 CAN) ---- */
+@@ -544,34 +667,15 @@
+     fb_read(&fb);
+     uint32_t fb_age = 0;
+     bool fb_fresh = fb_is_fresh(&fb, now, &fb_age);
+-    bool grace = (int32_t)(now - s_fb_grace_until_ms) < 0;
+-    bool fb_ok = fb_fresh || (!fb.valid && grace);
+-
+-    bool want_enable = lc_arm_armed(&s_arm) && !s_estop && !s_fault &&
+-                       !s_link_lost && !can_drv_is_recovering() && fb_ok;
+-
+-    /* ---- 6. 增益斜坡 ---- */
+-    if (want_enable) {
+-        if (s_ramp < GAIN_RAMP_STEPS) {
+-            s_ramp++;
+-        }
+-    } else if (s_ramp > 0u) {
+-        s_ramp = (s_ramp > GAIN_RAMP_DOWN) ? (uint16_t)(s_ramp - GAIN_RAMP_DOWN) : 0u;
+-    }
+-    float ratio = (float)s_ramp / (float)GAIN_RAMP_STEPS;
+-    s_kp_now = s_target_kp * ratio;
+-    s_kd_now = s_target_kd * ratio;
+-
+-    /* ---- 7. 使能/失能边沿 ---- */
+-    if (want_enable && !s_enabled) {
+-        s_enabled = true;
+-        can_submit_enable();
+-        s_fail_streak = 0;
+-    } else if (!want_enable && s_enabled) {
+-        s_enabled = false;
+-        can_submit_disable();
+-        lc_can_tx_clear_motion(&s_can_tx);
+-    }
++    ctrl_update_arm(&fb, now);
++    bool enabled = s_arm_phase == ARM_ACTIVE;
++    bool motion = enabled && s_motion_requested;
++    float ratio = enabled ? (float)s_ramp / (float)GAIN_RAMP_STEPS : 0.0f;
++    if (enabled && s_ramp < GAIN_RAMP_STEPS) {
++        s_ramp++;
++    }
++    s_kp_now = (motion ? s_target_kp : fminf(s_target_kp, ARM_HOLD_KP_MAX)) * ratio;
++    s_kd_now = (motion ? s_target_kd : fminf(s_target_kd, ARM_HOLD_KD_MAX)) * ratio;
+ 
+     /* ---- 8. 失能补发: 提交成功后 10ms 内再补 3 帧 (取代旧的"一次 50 帧") ---- */
+     if (s_need_disable_burst) {
+@@ -593,26 +697,27 @@
+     float dt = s_motion_at ? (float)lc_elapsed_ms(now, s_motion_at) * 0.001f : 0.001f;
+     s_motion_at = now;
+     /* A zero-gain enable is a diagnostic enable, never a hidden trajectory. */
+-    bool drive = want_enable && (velocity_mode ? s_target_kd > 0.0f : s_target_kp > 0.0f);
++    bool drive = motion && (velocity_mode ? s_target_kd > 0.0f : s_target_kp > 0.0f);
+     gm_step(&s_motion, drive, velocity_mode, s_target_pos_rad,
+             s_target_vel_rad_s, fb.valid ? fb.pos_rad : 0.0f, dt,
+             (velocity_mode ? GIMBAL_MANUAL_SPEED_MAX_DPS : GIMBAL_SPEED_MAX_DPS) * DEG2RAD, GIMBAL_ACCEL_DPS2 * DEG2RAD,
+             GIMBAL_JERK_DPS3 * DEG2RAD, MOTOR_PMAX);
+-    mit.pos_rad   = velocity_mode ? 0.0f : s_motion.position;
++    mit.pos_rad   = motion && velocity_mode ? 0.0f : s_motion.position;
+     mit.vel_rad_s = s_motion.velocity * ratio;
+-    mit.kp        = velocity_mode ? 0.0f : s_kp_now;
++    mit.kp        = motion && velocity_mode ? 0.0f : s_kp_now;
+     mit.kd        = s_kd_now;
+     /* Match the DM MIT speed example: no direct torque feedforward. */
+     mit.torque_nm = 0.0f;
+-    if (s_ramp == 0u) {
+-        mit.pos_rad = fb.valid ? fb.pos_rad : 0.0f;
+-    }
+-
+     lc_can_frame_t mf;
+     memset(&mf, 0, sizeof(mf));
+     mf.len  = 8u;
+     mf.prio = (uint8_t)LC_CAN_PRIO_MOTION;
+     mf.id   = dm_pack_mit(MOTOR_CAN_ID, &mit, mf.data);
++    if (!motion && fb.valid) {
++        uint16_t pos = s_arm_phase == ARM_IDLE ? fb.pos_raw : s_hold_raw;
++        mf.data[0] = (uint8_t)(pos >> 8);
++        mf.data[1] = (uint8_t)pos;
++    }
+     (void)lc_can_tx_request(&s_can_tx, &mf);
+ 
+     /* ---- 10. CAN 发送协调 ---- */
+@@ -636,8 +741,10 @@
+     snap.fb_age_ms     = fb.valid ? fb_age : 0xFFFFFFFFu;
+     snap.can_fail      = (uint16_t)((s_can_tx.submit_fail > 0xFFFFu)
+                                     ? 0xFFFFu : s_can_tx.submit_fail);
+-    snap.armed         = s_arm.armed;
+-    snap.enabled       = s_enabled;
++    /* Echo the internal authorization token, but advertise readiness only
++     * after the CAN enable and the motor's post-enable feedback both arrive. */
++    snap.armed         = enabled;
++    snap.enabled       = enabled;
+     snap.estop         = s_estop;
+     snap.fault         = s_fault;
+     snap.feedback_valid = fb.valid;
+@@ -669,6 +776,7 @@
+ static void ctrl_task(void *arg)
+ {
+     (void)arg;
++    can_submit_disable();
+ 
+     /* 先把 1kHz 硬件节拍打开 (此时调度器已在运行, 中断里可以安全用 FromISR)。 */
+     timer_drv_start_1khz(ctrl_tick_isr);
+@@ -1056,10 +1164,10 @@
+ 
+     lc_cmdq_init(&s_cmdq);
+     lc_arm_init(&s_arm);
++    lc_seq_gate_init(&s_applied_ctrl);
+     lc_can_tx_init(&s_can_tx);
+     memset(&g_fb, 0, sizeof(g_fb));
+     memset(&g_snap, 0, sizeof(g_snap));
+-    s_fb_grace_until_ms = APP_FB_GRACE_MS;   /* 上电后 1s 内允许无反馈 */
+ 
+     /* ---- 3. 任务 (静态分配, 优先级/栈见 app_tasks.h) ---- */
+     s_ctrl_task = xTaskCreateStatic(ctrl_task, "ctrl", APP_STACK_CTRL_WORDS, NULL,
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/can_drv.c
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/can_drv.c
+@@ -293,6 +293,13 @@
+     return done;
+ }
+ 
++bool can_drv_tx_idle(void)
++{
++    const uint32_t empty = CDRV_TSR_TME(0) | CDRV_TSR_TME(1) | CDRV_TSR_TME(2);
++    return (CAN1->TSR & empty) == empty &&
++           !s_mailbox_pending[0] && !s_mailbox_pending[1] && !s_mailbox_pending[2];
++}
++
+ void can_drv_abort_all(void)
+ {
+     taskENTER_CRITICAL();
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/dm_motor.c
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/src/dm_motor.c
+@@ -120,6 +120,7 @@
+     fb->id        = id;
+     fb->err       = err;
+     fb->pos_rad   = dm_uint_to_float(p_int, -MOTOR_PMAX, MOTOR_PMAX, 16);
++    fb->pos_raw   = p_int;
+     fb->vel_rad_s = dm_uint_to_float(v_int, -MOTOR_VMAX, MOTOR_VMAX, 12);
+     fb->torque_nm = dm_uint_to_float(t_int, -MOTOR_TMAX, MOTOR_TMAX, 12);
+     fb->temp_mos  = data[6];
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/FreeRTOS.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/FreeRTOS.h
+@@ -5,6 +5,14 @@
+ typedef uint32_t TickType_t;
+ typedef int StaticSemaphore_t;
+ typedef void *SemaphoreHandle_t;
++typedef int BaseType_t;
++typedef unsigned UBaseType_t;
++typedef int StaticTask_t;
++typedef uint32_t StackType_t;
++typedef void *TaskHandle_t;
+ #define pdTRUE 1
++#define pdFALSE 0
+ #define pdMS_TO_TICKS(x) (x)
++#define portYIELD_FROM_ISR(woken) ((void)(woken))
++#define portMAX_DELAY UINT32_MAX
+ #endif
+--- /dev/null
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/queue.h
+@@ -0,0 +1,10 @@
++#ifndef MOCK_QUEUE_H
++#define MOCK_QUEUE_H
++#include "FreeRTOS.h"
++typedef int StaticQueue_t;
++typedef void *QueueHandle_t;
++QueueHandle_t xQueueCreateStatic(UBaseType_t length, UBaseType_t item_size,
++                                 uint8_t *storage, StaticQueue_t *queue);
++BaseType_t xQueueSend(QueueHandle_t queue, const void *item, TickType_t timeout);
++BaseType_t xQueueReceive(QueueHandle_t queue, void *item, TickType_t timeout);
++#endif
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/stm32f1xx.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/stm32f1xx.h
+@@ -1,6 +1,7 @@
+ #ifndef MOCK_STM32F1XX_H
+ #define MOCK_STM32F1XX_H
+ #include <stdint.h>
++void NVIC_SystemReset(void);
+ /* Minimal register double for driver logic; not a bus/timing simulator. */
+ typedef struct {uint32_t TIR,TDTR,TDLR,TDHR;} MockTx;
+ typedef struct {uint32_t RIR,RDTR,RDLR,RDHR;} MockRx;
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/task.h
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/mocks/task.h
+@@ -1,3 +1,13 @@
+ #include "FreeRTOS.h"
+ #define taskENTER_CRITICAL() ((void)0)
+ #define taskEXIT_CRITICAL() ((void)0)
++enum { eSetBits };
++TickType_t xTaskGetTickCount(void);
++BaseType_t xTaskNotifyFromISR(TaskHandle_t task, uint32_t value, int action, BaseType_t *woken);
++BaseType_t xTaskNotifyWait(uint32_t clear_in, uint32_t clear_out, uint32_t *value, TickType_t timeout);
++void vTaskDelay(TickType_t delay);
++void vTaskDelayUntil(TickType_t *wake, TickType_t delay);
++UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
++TaskHandle_t xTaskCreateStatic(void (*run)(void *), const char *name, uint32_t size,
++                               void *arg, UBaseType_t prio, StackType_t *stack, StaticTask_t *buf);
++void vTaskStartScheduler(void);
+--- a/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/test_can_driver.c
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/test_can_driver.c
+@@ -7,13 +7,19 @@
+ int main(void) {
+     uint8_t bytes[8]={1,2,3,4,5,6,7,8};
+     const uint32_t tme=1u<<26;
++    mock_can.TSR=7u<<26;
++    CHECK(can_drv_tx_idle());
+     mock_can.TSR=tme;
++    CHECK(!can_drv_tx_idle());
+     CHECK(can_drv_send(1,bytes,8));
+     mock_can.TSR=tme|CAN_TSR_RQCP0|CAN_TSR_TXOK0;
++    CHECK(!can_drv_tx_idle());
+     CHECK(!can_drv_send(2,bytes,8)); /* Completed result must be collected before reuse. */
+     can_tx_done_t done=can_drv_poll_tx();
+     CHECK(done.completed==1 && done.ok==1 && done.failed==0);
+     CHECK(mock_can.TSR==CAN_TSR_RQCP0); /* Driver writes the actual W1C bit. */
++    mock_can.TSR=7u<<26;
++    CHECK(can_drv_tx_idle());
+     mock_can.TSR=tme;
+     CHECK(can_drv_send(1,bytes,8));
+     mock_can.TSR=tme|CAN_TSR_RQCP0|CAN_TSR_TERR0;
+--- /dev/null
++++ b/02_TargetCarrier -geek-I2C/靶车/firmware/stm32_f103/test/test_reenable.c
+@@ -0,0 +1,269 @@
++/* Compile the actual 1 kHz control loop with deterministic CAN and RTOS mocks. */
++#include <assert.h>
++#include <stdio.h>
++#include "../src/app_main.c"
++
++static uint32_t tick;
++static bool healthy, recovering, can_busy, hold_ack;
++static can_tx_done_t completion;
++static uint8_t last_can[8];
++static unsigned sent, enables, disables;
++static int mutex;
++
++TickType_t xTaskGetTickCount(void) { return tick; }
++bool can_drv_lock(uint32_t timeout) { return timeout == 0; }
++void can_drv_unlock(void) {}
++bool can_drv_is_healthy(void) { return healthy; }
++bool can_drv_is_recovering(void) { return recovering; }
++bool can_drv_tx_idle(void) { return !can_busy; }
++void can_drv_abort_all(void) { can_busy = false; completion = (can_tx_done_t){0}; }
++can_tx_done_t can_drv_poll_tx(void)
++{
++    can_tx_done_t done = completion;
++    completion = (can_tx_done_t){0};
++    if (done.completed) can_busy = false;
++    return done;
++}
++bool can_drv_send(uint32_t id, const uint8_t *data, uint8_t len)
++{
++    assert(len == 8);
++    ++sent;
++    memcpy(last_can, data, len);
++    if (id == MOTOR_CAN_ID && !memcmp(data, "\xff\xff\xff\xff\xff\xff\xff", 7)) {
++        enables += data[7] == DM_CMD_ENABLE;
++        disables += data[7] == DM_CMD_DISABLE;
++    }
++    if (s_arm_phase >= ARM_PRIME && s_arm_phase <= ARM_ENABLE_SENT) {
++        assert(!can_busy);
++        can_busy = true;
++        if (!hold_ack) completion = (can_tx_done_t){1, 1, 0};
++    }
++    return true;
++}
++BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t timeout)
++{
++    (void)q; (void)item; (void)timeout;
++    return pdFALSE;
++}
++BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t timeout)
++{
++    (void)q; (void)item; (void)timeout;
++    return pdTRUE;
++}
++
++static void feedback(uint16_t raw, uint8_t state, float speed)
++{
++    const uint8_t data[8] = { (uint8_t)((state << 4) | MOTOR_CAN_ID),
++        (uint8_t)(raw >> 8), (uint8_t)raw, 0x7f, 0xf7, 0xff, 25, 25 };
++    dm_feedback_t fb = {0};
++    assert(dm_parse_feedback(MOTOR_CAN_ID, data, sizeof(data), &fb));
++    fb.vel_rad_s = speed;
++    fb_update(&fb);
++}
++
++static void step(void) { ctrl_step(tick++); }
++static void cmd(uint8_t seq, uint16_t flags, int16_t yaw, int16_t rate, bool safety)
++{
++    g_last_ctrl_ms = tick;
++    g_have_ctrl = true;
++    lc_cmd_t c = { .seq = seq, .flags = flags, .yaw_q = yaw, .yawrate_q = rate,
++                   .rx_ms = tick, .safety = safety };
++    assert(lc_cmdq_push(&s_cmdq, &c));
++}
++
++static void reset(void)
++{
++    tick = 1000;
++    healthy = true;
++    recovering = can_busy = hold_ack = false;
++    sent = enables = disables = 0;
++    completion = (can_tx_done_t){0};
++    g_fb = (fb_state_t){0};
++    g_last_ctrl_ms = 0;
++    g_have_ctrl = false;
++    g_failsafe_events = s_seen_failsafe = 0;
++    g_can_recover_events = s_seen_recover = 0;
++    s_fault = s_estop = s_abort_mailboxes = s_need_disable_burst = false;
++    s_link_lost = true;
++    s_fail_streak = s_prev_submit_fail = 0;
++    s_motion_at = s_fault_mask_until_ms = 0;
++    s_cmdq_mtx = &mutex;
++    lc_cmdq_init(&s_cmdq);
++    lc_can_tx_init(&s_can_tx);
++    lc_seq_gate_init(&s_applied_ctrl);
++    lc_arm_init(&s_arm);
++    can_submit_disable();
++    cmd(1, 0, 0, 0, true);
++    for (unsigned i = 0; i < 25; ++i) step();
++    s_target_kp = 200.0f;
++    s_target_kd = 3.0f;
++}
++
++static void check_hold(uint16_t raw, bool zero_gain)
++{
++    assert(((uint16_t)last_can[0] << 8 | last_can[1]) == raw);
++    assert(((unsigned)last_can[2] << 4 | last_can[3] >> 4) == 2047u);
++    assert(((unsigned)(last_can[6] & 0x0f) << 8 | last_can[7]) == 2047u);
++    if (zero_gain) {
++        assert(!(last_can[3] & 0x0f) && !last_can[4] &&
++               !last_can[5] && !(last_can[6] >> 4));
++    }
++}
++
++static uint16_t arm(uint8_t token)
++{
++    return proto_flags_set_token(CTRL_FLAG_ENABLE | CTRL_FLAG_ARM, token);
++}
++
++static void use_hold_then_move(uint16_t raw)
++{
++    reset();
++    feedback(raw, 0, 0);
++    cmd(2, arm(1), 0, 1800, true);
++    hold_ack = true;
++    step();
++    assert(s_arm_phase == ARM_PRIME_SENT && !enables);
++    check_hold(raw, true);
++    step();
++    assert(s_arm_phase == ARM_PRIME_SENT && !enables);
++    completion = (can_tx_done_t){1, 1, 0};
++    step();
++    assert(s_arm_phase == ARM_ENABLE && !enables);
++    step();
++    assert(s_arm_phase == ARM_ENABLE_SENT && enables == 1);
++    feedback(raw, 1, 0);
++    cmd(3, arm(1) | CTRL_FLAG_MOTION | CTRL_FLAG_VELOCITY, 0, -100, false);
++    step();
++    assert(!g_snap.armed && !g_snap.enabled && !s_motion_requested);
++    completion = (can_tx_done_t){1, 1, 0};
++    step();
++    assert(s_arm_phase == ARM_CONFIRM);
++    step();
++    assert(!g_snap.armed && !g_snap.enabled);
++    check_hold(raw, true);
++    feedback(raw, 1, 0);
++    step();
++    assert(s_arm_phase == ARM_ACTIVE && g_snap.armed && g_snap.enabled);
++    check_hold(raw, true);
++    for (unsigned i = 0; i < GAIN_RAMP_STEPS + 1; ++i) {
++        feedback(raw, 1, 0);
++        cmd((uint8_t)(4 + i), arm(1) | CTRL_FLAG_VELOCITY, 0, -1800, false);
++        step();
++        check_hold(raw, false);
++        assert(s_motion.velocity == 0 && g_snap.kp <= ARM_HOLD_KP_MAX &&
++               g_snap.kd <= ARM_HOLD_KD_MAX);
++    }
++    uint8_t seq = (uint8_t)(5 + GAIN_RAMP_STEPS);
++    cmd(seq++, arm(1) | CTRL_FLAG_MOTION | CTRL_FLAG_VELOCITY, 0, 100, false);
++    step();
++    assert(s_motion_requested && s_motion.velocity > 0 && g_snap.target_vel_dps > 0);
++    cmd(seq++, arm(1) | CTRL_FLAG_MOTION | CTRL_FLAG_VELOCITY, 0, -100, false);
++    cmd(seq++, CTRL_FLAG_ESTOP, 0, 0, true);
++    step();
++    assert(!s_motion_requested && !s_arm.armed && !g_snap.enabled && s_ramp == 0);
++    check_hold(raw, true);
++    /* Even with an explicitly new token the previous enabled feedback and
++     * outstanding DISABLE burst cannot be used to enable in the next tick. */
++    cmd(seq++, arm(2), 0, 0, true);
++    step();
++    assert(enables == 1 && !s_arm.armed && s_arm_phase == ARM_IDLE);
++    feedback(raw, 0, 0);
++    for (unsigned i = 0; i < 25; ++i) step();
++    cmd(seq++, arm(2), 0, 0, true);
++    step();
++    assert(enables == 1 && !s_arm.armed);
++    hold_ack = false;
++    cmd(seq++, arm(3), 0, 0, true);
++    step(); step(); step();
++    assert(enables == 2);
++}
++
++static void invalid_preconditions(void)
++{
++    for (unsigned i = 0; i < 7; ++i) {
++        reset();
++        if (i != 0) feedback(41234, i == 3 ? 1 : i == 4 ? 10 : 0, i == 2 ? .2f : 0);
++        if (i == 1) tick += ARM_FB_MAX_AGE_MS + 1;
++        healthy = i != 5;
++        recovering = i == 6;
++        cmd(2, arm(1), 0, 0, true);
++        step(); step(); step();
++        assert(!enables && !s_arm.armed && !g_snap.enabled);
++    }
++    reset();
++    feedback(41234, 0, 0);
++    cmd(2, arm(1) | CTRL_FLAG_MOTION, 100, 0, true);
++    step(); step(); step();
++    assert(!enables && !s_arm.armed);
++}
++
++static void delayed_motion_before_confirmation(void)
++{
++    reset();
++    feedback(41234, 0, 0);
++    cmd(2, arm(1), 0, 0, true);
++    step(); step(); step(); step();
++    feedback(41234, 1, 0);
++    step();
++    assert(s_arm_phase == ARM_ACTIVE);
++    cmd(3, arm(1) | CTRL_FLAG_MOTION | CTRL_FLAG_VELOCITY, 0, -100, false);
++    s_cmdq.q[0].rx_ms = s_arm_confirmed_at;
++    step();
++    assert(!s_motion_requested);
++    cmd(4, arm(1) | CTRL_FLAG_MOTION | CTRL_FLAG_VELOCITY, 0, 100, false);
++    step();
++    assert(s_motion_requested && s_motion.velocity > 0);
++}
++
++static void interrupted_enable(void)
++{
++    for (unsigned i = 0; i < 4; ++i) {
++        reset();
++        feedback(41234, 0, 0);
++        hold_ack = true;
++        cmd(2, arm(1), 0, 0, true);
++        step();
++        if (i == 0) {
++            completion = (can_tx_done_t){1, 0, 1};
++        } else if (i == 1) {
++            cmd(3, CTRL_FLAG_ESTOP, 0, 0, true);
++        } else if (i == 2) {
++            g_failsafe_events++;
++        } else {
++            feedback(42000, 0, 0);
++        }
++        step();
++        assert(!enables && !s_arm.armed && !g_snap.enabled);
++    }
++    reset();
++    feedback(41234, 0, 0);
++    cmd(2, arm(1), 0, 0, true);
++    step(); step();
++    hold_ack = true;
++    step();
++    assert(enables == 1 && s_arm_phase == ARM_ENABLE_SENT);
++    completion = (can_tx_done_t){1, 0, 1};
++    step();
++    assert(!s_arm.armed && !g_snap.enabled);
++}
++
++int main(void)
++{
++    const float rad = 180.0f / (float)M_PI;
++    for (uint32_t code = 0; code <= UINT16_MAX; code++) {
++        float pos = dm_uint_to_float((uint16_t)code, -MOTOR_PMAX, MOTOR_PMAX, 16);
++        float deg = pos * rad;
++        float orientation = deg - roundf(deg / 360.0f) * 360.0f;
++        float quantized = roundf(orientation * 100.0f) * 0.01f / rad;
++        assert(fabsf(gm_nearest(quantized, pos, MOTOR_PMAX) - pos) <= 0.0001f);
++    }
++    use_hold_then_move(0);
++    use_hold_then_move(4095);
++    use_hold_then_move(61439);
++    use_hold_then_move(65535);
++    invalid_preconditions();
++    interrupted_enable();
++    delayed_motion_before_confirmation();
++    puts("Re-enable CAN frames, full position range, stale or moving feedback, and STOP barriers passed");
++    return 0;
++}
+--- a/05_上位机/02_I2C上位机/source/target_ble.py
++++ b/05_上位机/02_I2C上位机/source/target_ble.py
+@@ -9,7 +9,7 @@
+ from collections import deque
+ from ble_connect import open_ble, discover_devices, device_matches, connection_error
+ from bounded_gatt import bounded_await, close_session, cleanup_pending
+-from target_wire import SERVICE, COMMAND, STATUS, control, gains, decode, quantized_gains, VELOCITY_FLAG, orientation
++from target_wire import SERVICE, COMMAND, STATUS, control, gains, decode, quantized_gains, MOTION_FLAG, VELOCITY_FLAG, orientation
+ from target_motion import TargetMotion
+ from target_parameters import TargetParameters
+ from armor_control import ArmorControl
+@@ -29,6 +29,7 @@
+         self.firmware_alignment_confirmed=False
+         self.en=False;self.estop=True;self.arm_token=0;self.seq=0;self.revision=0
+         self.arm_confirmed=False
++        self.motion_requested=False
+         self.clear_error=False;self.clear_sent_at=None;self.stop_waiting=False;self.last_diagnostic=None
+         self.health=self.stm=self.motor=None;self.health_at=self.stm_at=self.motor_at=None
+         self.identity=None;self.rx_seq={};self.tx_history=deque(maxlen=100)
+@@ -82,6 +83,7 @@
+             self.gains_dirty=True
+             self.parameters.cancel(reason)
+             self.arm_confirmed=False
++            self.motion_requested=False
+             self.planner.hold((self.stm or {}).get('yaw'),(self.stm or {}).get('pitch'))
+             self.last_target=(self.planner.yaw,self.planner.pitch,0.,0.)
+             self.notice=reason+'；已请求急停/失能，等待控制器反馈'
+@@ -169,7 +171,8 @@
+         motor_fresh=bool(self.connected and ha<800 and ma<=300 and not motor.get('safety',16)&16)
+         safety=motor.get('safety',0)
+         enabled=(1 if safety&2 else 0) if motor_fresh else -1
+-        arm=int(self.en and motor_fresh and safety&1 and motor.get('token')==self.arm_token)
++        arm=int(bool(self.en and st_fresh and stm.get('state')==1 and enabled==1 and
++                     safety&1 and motor.get('token')==self.arm_token))
+         raw_err=stm.get('error',0);error=raw_err if raw_err>=8 else 0
+         if stm.get('state')==4 or safety&8:error=error or 1
+         safe=not st_fresh or not motor_fresh or bool(health.get('flags',4)&4) or bool(safety&(32|64)) or bool(error)
+@@ -331,6 +334,7 @@
+                 # Arming only holds the latest actual pose. Old angles, rates,
+                 # sine/sweep/cruise selections never start by clicking ENABLE.
+                 self.planner.hold(s['st_yaw'],0);self.last_target=(self.planner.yaw,0.,0.,0.)
++                self.motion_requested=False
+                 self.arm_token=(s['arm_token']+1)&255 or 1;self.en=True;self.enable_at=self.clock()
+             elif name=='angles':
+                 self._require_motion(s,position=True)
+@@ -358,6 +362,8 @@
+                 if s['enabled']!=0:raise ValueError('清除旧轨迹前必须确认失能')
+                 self.planner.rates(0,0)
+             else:raise ValueError('不支持的靶车操作')
++            if name in ('angles','velocity','program_velocity','smooth_stop','profile','cruise'):
++                self.motion_requested=True
+             self.revision+=1;self.pending=name;self.pending_at=self.clock()
+             self._log('操作',f'{name} 已提交 values={values} target={self.last_target} kp={self.kp} kd={self.kd}')
+         return True
+@@ -410,10 +416,13 @@
+                     if self.en and self.enable_at is not None:dt=min(dt,now-self.enable_at)
+                     if self.en and dt>.25:self.stop('电脑控制调度停顿，旧运动作废')
+                     last_step=now
+-                    target=self.planner.step(dt) if self.en else (self.planner.yaw,self.planner.pitch,0.,0.)
++                    motion=self.en and self.arm_confirmed and self.motion_requested
++                    target=self.planner.step(dt) if motion else (self.planner.yaw,self.planner.pitch,0.,0.)
+                     self.last_target=target
+                     flags=(1|16|(self.arm_token<<8)) if self.en else 0
+-                    if self.planner.velocity and self.en:flags|=VELOCITY_FLAG
++                    if motion:
++                        flags|=MOTION_FLAG
++                        if self.planner.velocity:flags|=VELOCITY_FLAG
+                     if self.estop:flags|=8
+                     if self.pending=='clear_error':
+                         # STM32 returns early on ESTOP. Clear without ESTOP or
+@@ -508,7 +517,7 @@
+             stopped=self._controller_stopped(s)
+             phase=self.phase
+             if self.connected and not fresh:phase='BLE 已连接，等待桥接健康帧；STM32 状态未确认'
+-            if fresh:phase='STM32 / 电机故障锁定' if s['st_err'] else '靶车已使能' if s['enabled']==1 else '控制器已停止' if stopped else 'BLE 在线，下游状态待确认'
++            if fresh:phase='STM32 / 电机故障锁定' if s['st_err'] else '靶车已使能' if s['arm'] else '控制器已停止' if stopped else 'BLE 在线，下游状态待确认'
+             notice=self._feedback_notice(s) if fresh and (self.stop_waiting or self.locked and not self.pending) else self.notice
+             if fresh and self.pending=='clear_error':phase='正在清除故障，保持失能'
+             can_clear=fresh and not self.pending and bool(s['st_err']) and self._clear_allowed(s)
+--- a/05_上位机/02_I2C上位机/source/target_wire.py
++++ b/05_上位机/02_I2C上位机/source/target_wire.py
+@@ -35,8 +35,9 @@
+ 
+ 
+ VELOCITY_FLAG = 0x40
++MOTION_FLAG = 0x80
+ CAPABILITY_RID = 254
+-CAPABILITY_VALUE = 0x00060101
++CAPABILITY_VALUE = 0x00060102
+ 
+ def orientation(degrees):
+     if type(degrees) not in (int,float) or not math.isfinite(degrees):raise ValueError('角度必须为有限数值')
+--- a/05_上位机/02_I2C上位机/source/tests/test_continuous.py
++++ b/05_上位机/02_I2C上位机/source/tests/test_continuous.py
+@@ -40,7 +40,7 @@
+         now[0]=1.1;p.next_packet(2);now[0]=2.2;p.next_packet(3)
+         self.assertFalse(p.config_verified);self.assertIn('配套固件',p.config_result)
+     def test_wrong_capability_and_control_mode_block_enable(self):
+-        for cap,mode in ((0,1),(CAPABILITY_VALUE,2)):
++        for cap,mode in ((0,1),(0x00060101,1),(CAPABILITY_VALUE,2)):
+             p=TargetParameters(lambda:0);p.start('read_config',{})
+             for rid,v,kind in ((254,cap,'I'),(10,mode,'I'),(21,12.5,'f'),(22,45.,'f'),(23,10.,'f')):
+                 p.next_packet(1);p.receive(dict(rid=rid,ok=1,raw=struct.pack('<'+kind,v).hex()))
+--- a/05_上位机/02_I2C上位机/source/tests/test_target_ble.py
++++ b/05_上位机/02_I2C上位机/source/tests/test_target_ble.py
+@@ -1,12 +1,13 @@
+ import asyncio
+ import json
++import math
+ import struct
+ import sys
+ import time
+ import unittest
+ from pathlib import Path
+ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+-from target_wire import SERVICE,COMMAND,STATUS,control,gains,decode,crc16,frame,CAPABILITY_RID,CAPABILITY_VALUE,VELOCITY_FLAG
++from target_wire import SERVICE,COMMAND,STATUS,control,gains,decode,crc16,frame,CAPABILITY_RID,CAPABILITY_VALUE,MOTION_FLAG,VELOCITY_FLAG
+ from target_motion import TargetMotion
+ from target_ble import BleTargetAdapter
+ from ble_connect import open_ble
+@@ -24,6 +25,7 @@
+         self.services=Services();self.is_connected=False;self.writes=[];self.ctrl_seq=0
+         self.seq=0;self.flags=8;self.token=0;self.position=0.;self.yaw=0.;self.disarm=False
+         self.reject_enable=False;self.epoch=1;self.fail=False
++        self.confirm_enable=True
+         self.fault=False;self.persist_fault=False;self.velocity=0.;self.extra_safety=0;self.ignore_control=False;self.clear_requests=0
+         self.fault_reassert_at=None
+         self.write_delay=0
+@@ -42,11 +44,11 @@
+                 if self.fault_reassert_at is not None and time.monotonic()>=self.fault_reassert_at:
+                     self.fault=True;self.fault_reassert_at=None
+                 enabled=bool(self.flags&1 and not self.reject_enable)
+-                state=3 if self.flags&8 else 4 if self.fault else 1 if enabled else 0
++                state=3 if self.flags&8 else 4 if self.fault else 1 if enabled and self.confirm_enable else 0
+                 self.seq=(self.seq+1)&255
+                 callback(None,status_frame(self.seq,state,self.position,1 if enabled else 0))
+                 safety=(3 if enabled else 0)|(4 if state==3 else 0)|(8 if self.fault else 0)|self.extra_safety
+-                callback(None,frame(6,self.seq,struct.pack('<hhhHBBB',round(self.position/.01),round(self.velocity/.01),0,0,safety,0,self.token)))
++                callback(None,frame(6,self.seq,struct.pack('<hhhHBBB',round(math.radians(self.position)/.01),round(self.velocity/.01),0,0,safety,0,self.token)))
+                 callback(None,self.health())
+                 await asyncio.sleep(.02)
+         self.task=asyncio.create_task(send())
+@@ -72,7 +74,8 @@
+             if not self.flags&1:self.disarm=True
+             if self.flags&1:self.token=self.flags>>8
+             self.yaw=struct.unpack_from('<h',data,7)[0]*.01
+-            if self.flags&1 and not self.reject_enable:self.position=self.yaw
++            if self.flags&MOTION_FLAG and self.flags&1 and not self.reject_enable:
++                self.position=self.yaw
+ 
+ 
+ class CodecAndMotionTests(unittest.TestCase):
+@@ -133,6 +136,37 @@
+     async def test_enable_uses_actual_arm_echo_and_enabled_feedback(self):
+         await self.enable();s=self.a.snapshot()['status']
+         self.assertEqual(s['arm'],1);self.assertEqual(s['st_err'],0);self.assertEqual(s['enabled'],1)
++    async def test_reenable_sends_only_hold_until_confirmation_and_new_motion(self):
++        await self.enable()
++        self.a.command('velocity',dict(yaw_rate=-30,pitch_rate=0))
++        await self.until(lambda:not self.a.pending)
++        self.a.stop()
++        await self.until(lambda:self.a.snapshot()['controller_stop_confirmed'] and not self.a.gains_dirty)
++        client=self.a.client
++        client.position=math.degrees(12.5)
++        await self.until(lambda:self.a.snapshot()['status']['st_yaw']>700)
++        await self.release()
++        previous_token=self.a.arm_token
++        client.confirm_enable=False
++        start=len(client.writes)
++        self.a.command('enable')
++        await self.until(lambda:self.a.snapshot()['status']['enabled']==1)
++        self.assertFalse(self.a.arm_confirmed)
++        self.assertEqual(self.a.snapshot()['status']['arm'],0)
++        self.assertEqual(self.a.pending,'enable')
++        client.confirm_enable=True
++        await self.until(lambda:self.a.arm_confirmed and not self.a.pending)
++        self.assertNotEqual(self.a.arm_token,previous_token)
++        controls=[p for p in client.writes[start:] if p[2]==1 and p[4]&1]
++        self.assertTrue(controls)
++        self.assertTrue(all(not p[4]&(MOTION_FLAG|VELOCITY_FLAG) and p[11:15]==bytes(4) for p in controls))
++        self.assertGreater(client.position,700)
++        self.a.command('velocity',dict(yaw_rate=10,pitch_rate=0))
++        await self.until(lambda:not self.a.pending)
++        motion=[p for p in client.writes[start:] if p[2]==1 and p[4]&MOTION_FLAG]
++        self.assertTrue(motion)
++        self.assertTrue(motion[0][4]&VELOCITY_FLAG)
++        self.assertEqual(struct.unpack_from('<h',motion[0],11)[0],100)
+     async def test_declined_enable_does_not_become_success_on_gatt_ack(self):
+         await self.release();self.a.client.reject_enable=True;self.a.command('enable')
+         await self.until(lambda:self.a.locked and not self.a.en,timeout=3)
+--- a/05_上位机/02_I2C上位机/source/unified.py
++++ b/05_上位机/02_I2C上位机/source/unified.py
+@@ -292,12 +292,12 @@
+     diag_log.setLevel(logging.INFO)
+     diag_log.addHandler(diag_handler)
+     diag_log.propagate = False
+-    log.info('TargetCarrier 6.1.3-I2C-xlimit started: %s',sys.executable)
++    log.info('TargetCarrier 6.1.3-I2C-target-reenable started: %s',sys.executable)
+     log.info('diagnosis timeline=%s ext=%s pulse_subscribe=%s file=%s',
+              os.environ.get('TC_DIAG_TIMELINE','on'), os.environ.get('TC_DIAG_EXT','on'),
+              os.environ.get('TC_PULSE_SUBSCRIBE','on'), base / 'logs' / 'diagnosis.log')
+     bridge = UnifiedBridge()
+-    window = webview.create_window('TargetCarrier · GEEK 双从机控制台 6.1.3（X 轴 I²C 限位版）',
++    window = webview.create_window('TargetCarrier · GEEK 双从机控制台 6.1.3（靶车再使能修复版）',
+         url=str(assets / 'web' / 'index.html'), js_api=bridge, width=1340, height=900,
+         min_size=(1000, 700), background_color='#f5f7fb', text_select=True)
+     bridge._window = window
