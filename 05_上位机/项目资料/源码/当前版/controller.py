@@ -14,10 +14,11 @@ from diag_timeline import Timeline
 from ext_diag import EXT1, EXT2, EXT_UUIDS
 
 class Controller:
-    def __init__(self, events, client_factory=None, scanner=None):
+    def __init__(self, events, client_factory=None, scanner=None, *, pulse_capture=True):
         self.events = events
         self.client_factory = client_factory
         self.scanner = scanner
+        self.pulse_capture = pulse_capture
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self.thread.start()
@@ -219,7 +220,9 @@ class Controller:
                 except WriteChannelTimeout:raise
                 except Exception as e:logging.getLogger('targetcarrier.link').warning('Optional ESP diagnostics unavailable: %s',e)
             pulse_subscribe = os.environ.get('TC_PULSE_SUBSCRIBE', 'on').strip().lower() not in ('0','off','false','no','disabled')
-            if service.get_characteristic(PULSE):
+            if not getattr(self, 'pulse_capture', True):
+                logging.getLogger('targetcarrier.diag').info('PULSE capture disabled by console configuration')
+            elif service.get_characteristic(PULSE):
                 if not pulse_subscribe:
                     # Diagnostic A/B switch only: default (unset/on) keeps the
                     # existing unconditional subscription behaviour.

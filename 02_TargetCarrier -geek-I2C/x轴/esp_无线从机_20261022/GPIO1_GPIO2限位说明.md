@@ -1,3 +1,5 @@
+> 历史限位方案。当前 I²C X 轴由 STM32 PB14、PB13 管理限位，见 [X 轴 README](../README.md)。
+
 # GPIO1 / GPIO2 任一路低电平限位停止
 
 此修改针对本目录 ESP32-S3 无线从机。实际 PUL/DIR 由 STM32 产生，GPIO6/7 是输入采集；本轮配套修改了上位机的 x 轴限位通信和复位模块；STM32、GEEK 主机和靶车不修改。
