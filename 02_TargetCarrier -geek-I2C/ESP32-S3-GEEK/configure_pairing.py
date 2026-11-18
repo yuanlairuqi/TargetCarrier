@@ -8,7 +8,7 @@ import secrets
 from pathlib import Path
 
 def mac(value):
-    if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}',value):raise argparse.ArgumentTypeError('STA MAC format aa:bb:cc:dd:ee:ff required')
+    if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}',value):raise argparse.ArgumentTypeError('STA MAC format 00:00:00:00:00:00 required')
     raw=bytes.fromhex(value.replace(':',''))
     if raw[0]&1 or not any(raw):raise argparse.ArgumentTypeError('nonzero unicast STA MAC required')
     return value.lower()
