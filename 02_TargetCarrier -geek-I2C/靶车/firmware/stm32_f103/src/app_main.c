@@ -51,6 +51,9 @@
 #define ARM_FB_MAX_AGE_MS 50u
 #define ARM_TIMEOUT_MS    200u
 #define ARM_STOP_SPEED    0.05f    /* rad/s, same stop criterion as the host */
+#define ARM_HOLD_SPEED    0.50f
+#define ARM_HOLD_SPEED_GRACE_MS 30u
+#define ARM_HOLD_SPEED_HARD_LIMIT 2.0f
 #define ARM_HOLD_ERROR    0.02f    /* rad, reject movement or a mapping discontinuity during hold */
 #define ARM_HOLD_KP_MAX   10.0f
 #define ARM_HOLD_KD_MAX   1.0f
@@ -162,6 +165,8 @@ static uint32_t s_arm_fb_sample;
 static uint32_t s_disable_fb_sample;
 static uint16_t s_hold_raw;
 static float    s_hold_pos_rad;
+static bool     s_hold_speed_exceeded;
+static uint32_t s_hold_speed_exceeded_at;
 static bool     s_motion_requested;
 static lc_seq_gate_t s_applied_ctrl;
 static bool     s_estop = false;
@@ -252,6 +257,7 @@ static void can_submit_disable(void)
     fb_read(&fb);
     s_disable_fb_sample = fb.sample;
     s_arm_phase = ARM_IDLE;
+    s_hold_speed_exceeded = false;
     s_motion_requested = false;
     s_target_pos_rad = fb.valid ? fb.pos_rad : 0.0f;
     s_target_vel_rad_s = 0.0f;
@@ -621,9 +627,19 @@ static void ctrl_update_arm(const fb_state_t *fb, uint32_t now)
             s_arm_confirmed_at = now;
             s_arm_phase = ARM_ACTIVE;
         }
-    } else if (fb->err != 1u ||
-               (!s_motion_requested && (!stopped || fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR))) {
+    } else if (fb->err != 1u || !feedback_ok ||
+               (!s_motion_requested && (fabsf(fb->pos_rad - s_hold_pos_rad) > ARM_HOLD_ERROR ||
+                                         fabsf(fb->vel_rad_s) > ARM_HOLD_SPEED_HARD_LIMIT))) {
         reject_arm();
+    } else if (!s_motion_requested && fabsf(fb->vel_rad_s) > ARM_HOLD_SPEED) {
+        if (!s_hold_speed_exceeded) {
+            s_hold_speed_exceeded = true;
+            s_hold_speed_exceeded_at = now;
+        } else if (lc_elapsed_ms(now, s_hold_speed_exceeded_at) >= ARM_HOLD_SPEED_GRACE_MS) {
+            reject_arm();
+        }
+    } else {
+        s_hold_speed_exceeded = false;
     }
 }
 

@@ -83,6 +83,8 @@ class LinearProgram:
             raise ValueError('x 轴需要连接并收到 STM32 停止确认')
         if 'target' in devices:
             t = b._target.snapshot()
+            if getattr(b._target, 'armor_snapshot', lambda: {'mode': 'motion'})().get('mode') != 'motion':
+                raise ValueError('请先切换到运动模式')
             if t['busy'] or not self._target_stopped(t):
                 raise ValueError('靶车需新版固件的新鲜 STM32 / 电机失能与零速反馈，旧版状态不能启动联合程序')
 
