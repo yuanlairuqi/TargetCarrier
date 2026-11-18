@@ -24,6 +24,8 @@ class BleTargetAdapter:
         self.phase='未连接';self.notice='搜索 TC-Target，连接靶车桥接 ESP；不再填写 IP'
         self.planner=TargetMotion();self.kp=0.;self.kd=0.;self.gains_configured=False
         self.armor = ArmorControl(clock)
+        self.control_mode = 'motion'
+        self.mode_stop_at = None
         self.parameters=TargetParameters(clock);self.rx_counts={};self.last_control_hex='';self.tx_count=0
         self.last_unsolicited_log=-1e9;self.parameter_logs_suppressed=0
         self.firmware_alignment_confirmed=False
@@ -254,6 +256,12 @@ class BleTargetAdapter:
                           f"uart_errors={s['uart_errors']} cmd_drops={s['cmd_drops']}")
             if self.stop_waiting and self._controller_stopped(s) and not s['st_err']:
                 self.notice=self._feedback_notice(s);self.stop_waiting=False
+            if (self.control_mode == 'stopping' and self.connected and self.mode_stop_at is not None
+                    and self.stm_at is not None and self.motor_at is not None
+                    and self.stm_at > self.mode_stop_at and self.motor_at > self.mode_stop_at
+                    and self.acked_revision >= self.revision and self._controller_stopped(s)):
+                self.control_mode = 'lighting'
+                self.mode_stop_at = None
             if not self.initial_hold and self._controller_stopped(s):
                 self.planner.hold(s['st_yaw'],0);self.initial_hold=True
             if self.en and (not s['st_fresh'] or s['st_err'] or s['safe']):
@@ -293,6 +301,8 @@ class BleTargetAdapter:
             return v
         with self.lock:
             s=self._status()
+            if self.control_mode != 'motion' and name in ('release','enable','angles','velocity','program_velocity','smooth_stop','profile','cruise','program_prepare'):
+                raise ValueError('请先切换到运动模式，再手动解除急停和使能')
             if not self.connected or self._fresh_age(self.health_at)>800:raise ValueError('请先连接靶车 BLE 并等待桥接状态')
             if not self.focused or self.clock()-self.last_alive>.7:raise ValueError('窗口未激活')
             if self.pending:raise ValueError('上一操作等待回报，请稍候')
@@ -463,8 +473,10 @@ class BleTargetAdapter:
                         with self.lock:self._log('发送',f'PARAM op={param[4]} rid={param[5]} frame={param.hex()}')
                 with self.lock:
                     lamp_flags = self._armor_link_flags()
-                    self.armor.cycle_tick(lamp_flags)
-                    lamp = self.armor.take(lamp_flags)
+                    lamp = None
+                    if self.control_mode == 'lighting':
+                        self.armor.cycle_tick(lamp_flags)
+                        lamp = self.armor.take(lamp_flags)
                 if lamp is not None:
                     await self._write(client, lamp, '装甲板灯控')
                 if now-last_read>.6 and self._fresh_age(self.health_at)>600:
@@ -498,16 +510,44 @@ class BleTargetAdapter:
 
     def armor_snapshot(self):
         with self.lock:
-            return self.armor.snapshot(self._armor_link_flags())
+            result = self.armor.snapshot(self._armor_link_flags())
+            result['mode'] = self.control_mode
+            result['ready'] = result['ready'] and self.control_mode == 'lighting'
+            return result
+
+    def set_control_mode(self, mode):
+        with self.lock:
+            if mode not in ('motion', 'lighting'):
+                raise ValueError('控制模式无效')
+            if mode == self.control_mode:
+                return True
+            if mode == 'lighting':
+                if not self.connected:
+                    raise ValueError('请先连接靶车')
+                self.control_mode = 'stopping'
+                self.stop('切换灯控模式')
+                self.mode_stop_at = self.clock()
+            else:
+                self.armor.set_cycle(False, self._armor_link_flags())
+                if self.armor.pending is not None:
+                    raise ValueError('等待上一条灯控命令完成后再切换')
+                self.stop('切换运动模式')
+                self.control_mode = 'motion'
+                self.mode_stop_at = None
+            return True
 
     def armor_set(self, color):
         with self.lock:
+            if self.control_mode != 'lighting':
+                raise ValueError('请先切换到灯控模式')
             self.armor.set_color(color, self._armor_link_flags())
             self.armor.cycling = False
         return True
 
     def armor_cycle(self, enabled):
         with self.lock:
+            if enabled and self.control_mode != 'lighting':
+                raise ValueError('请先切换到灯控模式')
             self.armor.set_cycle(enabled, self._armor_link_flags())
         return True
 

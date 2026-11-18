@@ -18,6 +18,12 @@ from linear_program import LinearProgram
 
 
 class UnifiedBridge(Bridge):
+    def target_control_mode(self, mode):
+        with self._lock:
+            if mode == 'lighting' and self._programs['target'].active:
+                self._programs['target'].cancel('切换灯控模式')
+            return self._target.set_control_mode(mode)
+
     def armor_set(self, color):
         return self._target.armor_set(color)
 

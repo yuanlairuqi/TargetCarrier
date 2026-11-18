@@ -247,6 +247,56 @@ static void interrupted_enable(void)
     assert(!s_arm.armed && !g_snap.enabled);
 }
 
+static void hold_speed_jitter(void)
+{
+    reset();
+    feedback(41234, 0, 0);
+    cmd(2, arm(1), 0, 0, true);
+    step(); step(); step(); step();
+    feedback(41234, 1, 0);
+    step();
+    assert(s_arm_phase == ARM_ACTIVE);
+    feedback(41234, 1, -0.549469f);
+    for (unsigned i = 0; i < 20; ++i) step();
+    assert(s_arm_phase == ARM_ACTIVE);
+    feedback(41234, 1, 0);
+    step();
+    assert(s_arm_phase == ARM_ACTIVE && !s_hold_speed_exceeded);
+    feedback(41234, 1, -0.549469f);
+    for (unsigned i = 0; i <= ARM_HOLD_SPEED_GRACE_MS; ++i) step();
+    assert(s_arm_phase == ARM_IDLE && !s_arm.armed);
+
+    reset();
+    feedback(41234, 0, 0);
+    cmd(2, arm(1), 0, 0, true);
+    step(); step(); step(); step();
+    feedback(41234, 1, 0);
+    step();
+    feedback(41234, 1, 2.1f);
+    step();
+    assert(s_arm_phase == ARM_IDLE && !s_arm.armed);
+
+    reset();
+    feedback(41234, 0, 0);
+    cmd(2, arm(1), 0, 0, true);
+    step(); step(); step(); step();
+    feedback(41234, 1, 0);
+    step();
+    feedback(41334, 1, 0.06f);
+    step();
+    assert(s_arm_phase == ARM_IDLE && !s_arm.armed);
+
+    reset();
+    feedback(41234, 0, 0);
+    cmd(2, arm(1), 0, 0, true);
+    step(); step(); step(); step();
+    feedback(41234, 1, 0);
+    step();
+    tick += ARM_FB_MAX_AGE_MS + 1;
+    step();
+    assert(s_arm_phase == ARM_IDLE && !s_arm.armed);
+}
+
 int main(void)
 {
     const float rad = 180.0f / (float)M_PI;
@@ -264,6 +314,7 @@ int main(void)
     invalid_preconditions();
     interrupted_enable();
     delayed_motion_before_confirmation();
+    hold_speed_jitter();
     puts("Re-enable CAN frames, full position range, stale or moving feedback, and STOP barriers passed");
     return 0;
 }

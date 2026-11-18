@@ -189,7 +189,7 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         await self.enable();self.a.alive(False);await asyncio.sleep(.1)
         self.assertTrue(self.a.locked);self.assertTrue(self.a.client.is_connected)
 
-    async def test_armor_cycle_preserves_enabled_motion_and_control_renewal(self):
+    async def test_armor_mode_stops_motion_and_keeps_last_color(self):
         await self.enable()
         self.a.command('velocity',dict(yaw_rate=20,pitch_rate=0))
         await self.until(lambda:not self.a.pending)
@@ -206,7 +206,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                 ticket=struct.unpack_from('<I',data,5)[0]
                 client.callback(None,frame(9,0,struct.pack('<BBI5x',1,data[4],ticket)))
         client.write_gatt_char=reply_to_armor
+        with self.assertRaises(ValueError): self.a.armor_cycle(True)
+        self.a.set_control_mode('lighting')
         await self.until(lambda:self.a.armor_snapshot()['ready'])
+        self.assertFalse(self.a.en)
+        self.assertTrue(self.a.locked)
         start=len(client.writes)
         self.a.armor_cycle(True)
         await self.until(lambda:len([p for p in client.writes[start:] if p[2]==8])>=3,timeout=4)
@@ -215,9 +219,13 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([p[4] for p in packets if p[2]==8][:3],[1,2,1])
         controls=[p for p in packets if p[2]==1]
         self.assertGreater(len(controls),3)
-        self.assertTrue(all(struct.unpack_from('<H',p,4)[0]&1 for p in controls))
-        self.assertTrue(self.a.en)
-        self.assertTrue(self.a.planner.velocity)
+        self.assertTrue(all(not struct.unpack_from('<H',p,4)[0]&1 for p in controls))
+        await self.until(lambda:not self.a.armor_snapshot()['pending'])
+        color=self.a.armor.color
+        self.a.set_control_mode('motion')
+        self.assertEqual(self.a.armor.color,color)
+        self.assertTrue(self.a.locked)
+        self.assertFalse(self.a.en)
     async def test_epoch_change_invalidates_authorization(self):
         await self.enable();generation=self.a.generation;self.a.client.epoch+=1
         await self.until(lambda:self.a.generation>generation)
