@@ -6,7 +6,7 @@ import argparse,secrets,re,json
 from pathlib import Path
 
 def mac(s):
- if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}',s):raise argparse.ArgumentTypeError('STA MAC required: aa:bb:cc:dd:ee:ff')
+ if not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}',s):raise argparse.ArgumentTypeError('STA MAC required: 00:00:00:00:00:00')
  b=bytes.fromhex(s.replace(':',''))
  if b[0]&1 or not any(b):raise argparse.ArgumentTypeError('Nonzero unicast STA MAC required')
  return s.lower()

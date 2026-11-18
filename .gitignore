@@ -1,0 +1,10 @@
+**/logs/
+**/历史日志/
+**/verification/
+**/.venv/
+**/__pycache__/
+**/build/
+**/build-*/
+**/pairing.local.defaults
+**/sdkconfig.paired
+*.log

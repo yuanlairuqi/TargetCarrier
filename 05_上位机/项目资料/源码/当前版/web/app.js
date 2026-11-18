@@ -175,7 +175,7 @@ createApp({components:{Icon},setup(){
  <section class="info-banner"><Icon name="info"/><div><b>统一管理与并行程序</b><p>两套设备可以分别连接和操作。连接恢复不自动启动；切出窗口请求停止。进入并行程序页面，为 x 轴和靶车分别追加动作或等待模块。两条线可同时执行，故障时联停。</p></div></section>
 </template>
 <template v-if="page==='target'">
-
+ 
  <div v-if="target.wireless" class="link-banner">USB → GEEK → ESP-NOW · 节点2 / 靶机（与X轴节点1独立）<button class="button secondary" :disabled="!!target.endpoint" @click="targetConnect">重新连接节点2</button><button class="button secondary" @click="targetCommand('disconnect')">停止并断开节点2</button></div><section v-else class="connection-strip"><div class="connection-label"><Icon name="bluetooth"/><span>靶车 BLE</span></div><select v-model="tc.device" aria-label="选择靶车 BLE 设备" :disabled="!!target.endpoint||target.scanning"><option value="">选择 TC-Target（靶车桥接 ESP）</option><option v-for="d in target.devices||[]" :value="d.key">{{d.name}} · {{d.key}}</option></select><button class="button secondary" :disabled="!ready||!!target.endpoint||target.scanning" @click="targetScan">{{target.scanning?'搜索中…':'搜索靶车'}}</button><button class="button primary" :disabled="!ready||targetPending||!!target.endpoint||!tc.device" @click="targetConnect">连接并锁定</button><button class="button secondary" :disabled="(!target.endpoint&&!target.scanning)||targetPending" @click="targetCommand('disconnect')">{{target.connecting||target.scanning?'取消连接 / 搜索':'停止并断开'}}</button></section>
  <div class="link-banner"><span class="dot" :class="{green:target.connected}"></span><b>{{target.phase}}</b><span>{{target.age_ms==null?'未收到状态':target.age_ms+' ms 前'}}</span></div>
  <div class="alert"><Icon name="info"/>{{target.notice}}。BLE、STM32 状态和电机反馈分别检查；控制器反馈不等于机械停止。</div>

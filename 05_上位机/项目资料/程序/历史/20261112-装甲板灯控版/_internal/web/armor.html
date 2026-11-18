@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>装甲板灯控</title>
+<link rel="stylesheet" href="style.css">
+<style>
+body { margin: 0; background: #f5f7fb; color: #17263d; }
+main { margin: 24px; padding: 20px; background: white; border: 1px solid #dce4ee; border-radius: 14px; }
+h1 { margin: 0 0 18px; font-size: 22px; }
+dl { display: grid; grid-template-columns: 7rem 1fr; gap: .65rem; margin-bottom: 20px; }
+dt { color: #45556b; }
+dd { margin: 0; font-weight: 650; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.actions button { min-width: 80px; }
+#message { min-height: 2rem; margin: 14px 0 0; color: #45556b; }
+</style>
+<script src="armor.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>装甲板灯控</h1>
+  <dl>
+    <dt>请求颜色</dt><dd id="requested">—</dd>
+    <dt>板端最近回报</dt><dd id="color">未知</dd>
+  </dl>
+  <div class="actions">
+    <button class="button secondary" type="button" data-color="0" disabled>熄灭</button>
+    <button class="button secondary" type="button" data-color="1" disabled>红色</button>
+    <button class="button secondary" type="button" data-color="2" disabled>蓝色</button>
+  </div>
+  <p id="message" role="status">等待连接</p>
+</main>
+</body>
+</html>

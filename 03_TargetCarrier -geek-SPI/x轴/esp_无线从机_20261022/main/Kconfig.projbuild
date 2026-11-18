@@ -85,7 +85,7 @@ config ROBOT_ESPNOW_CHANNEL
     default 1
     depends on ROBOT_ESPNOW_ENABLED
 config ROBOT_ESPNOW_CONTROLLER_MAC
-    string "Controller Wi-Fi STA MAC (aa:bb:cc:dd:ee:ff)"
+    string "Controller Wi-Fi STA MAC (00:00:00:00:00:00)"
     default ""
     depends on ROBOT_ESPNOW_ENABLED
 config ROBOT_ESPNOW_PMK
