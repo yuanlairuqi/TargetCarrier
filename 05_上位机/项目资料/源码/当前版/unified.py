@@ -44,11 +44,11 @@ class UnifiedBridge(Bridge):
         return True
 
     def __init__(self, controller=None, target=None):
-        super().__init__(controller)
+        super().__init__(controller, pulse_capture=False)
         self._target = target or UsbTargetAdapter()
         self._recorder = Recorder()
         self._stop_all_request=None
-        self._state['version'] = '6.1.3-I2C-xlimit'
+        self._state['version'] = '7.0'
         self._programs = {lane: LinearProgram(self, lane) for lane in ('x', 'target')}
 
     def refresh(self, focused=False):
@@ -298,12 +298,12 @@ def main():
     diag_log.setLevel(logging.INFO)
     diag_log.addHandler(diag_handler)
     diag_log.propagate = False
-    log.info('TargetCarrier 6.1.3-I2C-target-reenable started: %s',sys.executable)
-    log.info('diagnosis timeline=%s ext=%s pulse_subscribe=%s file=%s',
+    log.info('TargetCarrier 7.0 started: %s',sys.executable)
+    log.info('diagnosis timeline=%s ext=%s file=%s',
              os.environ.get('TC_DIAG_TIMELINE','on'), os.environ.get('TC_DIAG_EXT','on'),
-             os.environ.get('TC_PULSE_SUBSCRIBE','on'), base / 'logs' / 'diagnosis.log')
+             base / 'logs' / 'diagnosis.log')
     bridge = UnifiedBridge()
-    window = webview.create_window('TargetCarrier · GEEK 双从机控制台 6.1.3（靶车再使能修复版）',
+    window = webview.create_window('TargetCarrier · 双设备控制台 7.0',
         url=str(assets / 'web' / 'index.html'), js_api=bridge, width=1340, height=900,
         min_size=(1000, 700), background_color='#f5f7fb', text_select=True)
     bridge._window = window

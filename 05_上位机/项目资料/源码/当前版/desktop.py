@@ -19,9 +19,9 @@ from protocol import command, link_description
 VERSION = '3.0-ramp-linkfix'
 
 class Bridge:
-    def __init__(self, controller=None):
+    def __init__(self, controller=None, *, pulse_capture=True):
         self._events = queue.Queue(maxsize=1500)
-        self._controller = controller or Controller(self._events)
+        self._controller = controller or Controller(self._events, pulse_capture=pulse_capture)
         self._session_epoch=0
         self._status_revision=0
         self._run_recipe=None

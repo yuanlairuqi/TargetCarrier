@@ -186,8 +186,8 @@ class UsbClient:
 
 from controller import Controller
 class CombinedController(Controller):
-    def __init__(self,events):
-        super().__init__(events,client_factory=self.client_for)
+    def __init__(self, events, *, pulse_capture=True):
+        super().__init__(events, client_factory=self.client_for, pulse_capture=pulse_capture)
     async def connect(self,key):
         self._reconnect_enabled=True
         for attempt in range(4):

@@ -1,5 +1,5 @@
-# TargetCarrier 统一上位机 4.2
+# 控制台源码
 
-Vue + Python，保留原 USB/BLE x 轴、HTTP 靶车及 TC/2 调参入口。新增两条独立程序线：各自顺序执行，可并行运动并在运行中追加或编辑待执行模块。单独停止只中止本线，故障/失焦/全部停止联停两条。
+`unified.py` 是程序入口，`web/` 是界面。`controller.py` 管理 X 轴，`target_ble.py` 和 `target_usb.py` 管理靶车，`linear_program.py` 管理双设备程序。
 
-调度逻辑位于 linear_program.py，双线协调位于 unified.py；详见上一级 使用说明.md。使用 build-unified.ps1 打包，验证命令：python -m unittest discover -s tests -v。构建不代表实机通过。
+运行 `build-unified.ps1` 打包。直接启动已打包程序见 [上位机入口](../../../00_上位机合集说明.md)。
