@@ -1,10 +1,17 @@
 @echo off
-chcp 65001 >nul
-pushd "%~dp0项目资料\程序\控制台7.0"
-if not exist "TargetCarrier-7.0.exe" (
-  echo The Windows package must be fully extracted.
-  pause
-  exit /b 1
+setlocal
+set "INSTALL_ROOT=%LOCALAPPDATA%\Programs\TargetCarrier"
+for /f "tokens=2,*" %%A in ('reg query "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\TargetCarrier.Windows_is1" /v InstallLocation 2^>nul') do if /i "%%A"=="REG_SZ" set "INSTALL_ROOT=%%B"
+set "APP=%INSTALL_ROOT%\runtime\programs\console\TargetCarrier-7.0.exe"
+if exist "%APP%" (
+  start "" "%APP%"
+  exit /b
 )
-start "" "TargetCarrier-7.0.exe"
-popd
+set "SETUP=%~dp0..\05_windows\TargetCarrier-Setup.exe"
+if exist "%SETUP%" (
+  start "" "%SETUP%"
+  exit /b
+)
+echo TargetCarrier 7.0 Setup is missing. Download TargetCarrier-Setup.exe from GitHub Releases.
+pause
+exit /b 1

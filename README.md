@@ -1,5 +1,9 @@
 # TargetCarrier geek7.0
 
+**Windows 上位机 7.0 · [从 GitHub Release 下载安装程序](https://github.com/yuanlairuqi/TargetCarrier/releases/download/v7.0.0/TargetCarrier-Setup.exe) · [仓库安装程序](05_windows/TargetCarrier-Setup.exe)**
+
+从 **Code → Download ZIP** 下载整套工程后，完整解压并双击 `05_windows/TargetCarrier-Setup.exe`。安装面向当前用户，默认路径为 `%LOCALAPPDATA%\Programs\TargetCarrier`。在开始菜单的 **TargetCarrier** 文件夹中打开主控制台或 TC/2 调参工具。
+
 TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并行程序和 SD 录波。**日常使用推荐 I²C 版。**
 
 | 目录 | 作用 |
@@ -11,7 +15,7 @@ TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并
 
 ## 上位机简明操作手册
 
-1. **启动和连接**　按 [I²C 工程](<02_TargetCarrier -geek-I2C/README.md>) 核对接线及 [配套固件](<02_TargetCarrier -geek-I2C/当前交付.md>)。完整解压后双击 `05_上位机/启动靶车上位机.cmd`，在控制页搜索 BLE 设备，或选择 GEEK 的 USB 端口。到「设备总览」查看连接状态。
+1. **启动和连接**　安装后从开始菜单打开 TargetCarrier 7.0。按 [I²C 工程](<02_TargetCarrier -geek-I2C/README.md>) 核对接线及 [配套固件](<02_TargetCarrier -geek-I2C/当前交付.md>)。在控制页搜索 BLE 设备，或选择 GEEK 的 USB 端口。到「设备总览」查看连接状态。
 2. **操作 X 轴**　进入「X 轴控制」，确认停止且限位已释放。设置速度和加减速度，选择点动、持续正反转或交替运行。普通停机可用「减速停止」。
 3. **操作靶车**　进入「靶车控制」，确认处于运动模式。读取电机配置，在失能状态应用增益，再点击「解除急停」「使能靶车」。收到使能反馈后，设置偏航速度并点击「连续旋转 / 更新转速」。
 4. **操作灯光**　在侧栏切换「灯控模式」，等待靶车停止并失能，再选择颜色或红蓝循环。切回运动模式后，重新手动使能才可运动。
@@ -19,9 +23,11 @@ TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并
 
 并行程序、SD 录波和连接诊断见 [上位机使用说明](05_上位机/项目资料/使用说明.md)。
 
-## Windows 下载
+## Windows 安装与日志
 
-仅使用上位机时，下载[控制台 7.0 Windows 运行包](05_上位机/项目资料/程序/控制台7.0/Windows.zip)，完整解压到本机可写目录，双击 `启动靶车上位机.cmd`。压缩包同时包含 TC/2 调参程序。运行需要 Windows 的 Microsoft Edge WebView2 Runtime。使用 GitHub 的 Code → Download ZIP 下载整个工程时，从解压目录中的 `05_上位机` 启动。
+安装包自带 Python 运行组件和 TC/2。Windows 缺少 WebView2 时，安装程序通过微软官方 Evergreen Bootstrapper 联网安装。运行日志保存在 `%LOCALAPPDATA%\TargetCarrier\logs`。安装包为未签名构建，SmartScreen 提示取决于本机策略。
+
+原 X4000 程序在 `05_上位机/项目资料/程序/当前版`，用于历史版本维护。[安装包构建说明](05_windows/README.md)
 
 ## 固件与配对
 

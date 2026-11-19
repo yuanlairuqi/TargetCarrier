@@ -282,15 +282,17 @@ def main():
     import webview
     base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).resolve().parent
     assets = Path(getattr(sys, '_MEIPASS', base))
-    (base / 'logs').mkdir(exist_ok=True)
-    handler = RotatingFileHandler(base / 'logs' / 'connection.log', maxBytes=1024*1024, backupCount=3, encoding='utf-8')
+    local_app_data = Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local')
+    log_dir = local_app_data / 'TargetCarrier' / 'logs'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_dir / 'connection.log', maxBytes=1024*1024, backupCount=3, encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     log = logging.getLogger('targetcarrier.link')
     log.setLevel(logging.INFO)
     log.addHandler(handler)
     # Diagnosis timeline: separate, bounded, rotating file. It never carries
     # control decisions (see diag_timeline.py); TC_DIAG_TIMELINE=0 disables it.
-    diag_handler = RotatingFileHandler(base / 'logs' / 'diagnosis.log', maxBytes=2*1024*1024,
+    diag_handler = RotatingFileHandler(log_dir / 'diagnosis.log', maxBytes=2*1024*1024,
                                        backupCount=5, encoding='utf-8')
     diag_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s %(message)s',
                                                 datefmt='%Y-%m-%d %H:%M:%S'))
@@ -301,7 +303,7 @@ def main():
     log.info('TargetCarrier 7.0 started: %s',sys.executable)
     log.info('diagnosis timeline=%s ext=%s file=%s',
              os.environ.get('TC_DIAG_TIMELINE','on'), os.environ.get('TC_DIAG_EXT','on'),
-             base / 'logs' / 'diagnosis.log')
+             log_dir / 'diagnosis.log')
     bridge = UnifiedBridge()
     window = webview.create_window('TargetCarrier · 双设备控制台 7.0',
         url=str(assets / 'web' / 'index.html'), js_api=bridge, width=1340, height=900,
