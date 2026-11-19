@@ -1,6 +1,6 @@
 # 上位机怎么用
 
-打开 [控制台](../00_上位机合集说明.md)，推荐搭配 [I²C 固件](<../../02_TargetCarrier -geek-I2C/当前交付.md>)。在控制页选择 BLE 直连设备，或通过 USB 选择 GEEK 总机。
+打开 [控制台](../windows-guide.md)，推荐搭配 [I²C 固件](<../../02_TargetCarrier -geek-I2C/当前交付.md>)。在控制页选择 BLE 直连设备，或通过 USB 选择 GEEK 总机。
 
 | 入口 | 操作 |
 | --- | --- |

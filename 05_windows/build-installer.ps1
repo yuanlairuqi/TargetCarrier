@@ -5,11 +5,10 @@
 )
 
 $ErrorActionPreference = 'Stop'
-$repo = Split-Path -Parent $PSScriptRoot
 $console = (Resolve-Path -LiteralPath $ConsoleBuild).Path
 $compiler = (Resolve-Path -LiteralPath $Iscc).Path
 $bootstrapper = (Resolve-Path -LiteralPath $WebView2Bootstrapper).Path
-$portable = Join-Path $repo '05_上位机\项目资料\TC-Portable'
+$portable = Join-Path $PSScriptRoot 'project\TC-Portable'
 
 if (!(Test-Path -LiteralPath (Join-Path $console 'TargetCarrier-7.0.exe') -PathType Leaf) -or
     !(Test-Path -LiteralPath (Join-Path $console '_internal\web\index.html') -PathType Leaf)) {

@@ -4,7 +4,7 @@
 
 ## 构建
 
-1. 在 `05_上位机/项目资料/源码/当前版` 运行 `build-unified.ps1`。使用 x64 Python 3.11，并按仓库的锁定依赖构建 `dist/TargetCarrier-7.0`。
+1. 在 `05_windows/project/source/current` 运行 `build-unified.ps1`。使用 x64 Python 3.11，并按仓库的锁定依赖构建 `dist/TargetCarrier-7.0`。
 2. 准备 Inno Setup 7 的 `ISCC.exe` 和微软签名的 [WebView2 Evergreen Bootstrapper](https://developer.microsoft.com/microsoft-edge/webview2/#download-section)。
 3. 在本目录执行以下命令，把路径换成指定产物和工具的路径。
 

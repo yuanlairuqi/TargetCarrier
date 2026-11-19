@@ -11,7 +11,7 @@ TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并
 | [工程导航](00_工程导航与汇总/01_当前工程导航与汇总.md) | 查看完整目录和模块入口 |
 | [I²C 工程](<02_TargetCarrier -geek-I2C/README.md>) | 推荐使用，内含 X 轴、靶车和 GEEK 总机 |
 | [UART 工程](<01_TargetCarrier -geek-UART/README.md>)、[SPI 工程](<03_TargetCarrier -geek-SPI/README.md>) | 用于对应板间接口的设备 |
-| [Windows 上位机](05_上位机/00_上位机合集说明.md) | 控制台、源码和通用调参 |
+| [Windows 上位机](05_windows/windows-guide.md) | 控制台、源码和通用调参 |
 
 ## 上位机简明操作手册
 
@@ -21,13 +21,13 @@ TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并
 4. **操作灯光**　在侧栏切换「灯控模式」，等待靶车停止并失能，再选择颜色或红蓝循环。切回运动模式后，重新手动使能才可运动。
 5. **停止设备**　按 `Esc` 或点击「全部停止」，查看两台设备各自的停止反馈。
 
-并行程序、SD 录波和连接诊断见 [上位机使用说明](05_上位机/项目资料/使用说明.md)。
+并行程序、SD 录波和连接诊断见 [上位机使用说明](05_windows/project/user-guide.md)。
 
 ## Windows 安装与日志
 
 安装包自带 Python 运行组件和 TC/2。Windows 缺少 WebView2 时，安装程序通过微软官方 Evergreen Bootstrapper 联网安装。运行日志保存在 `%LOCALAPPDATA%\TargetCarrier\logs`。安装包为未签名构建，SmartScreen 提示取决于本机策略。
 
-原 X4000 程序在 `05_上位机/项目资料/程序/当前版`，用于历史版本维护。[安装包构建说明](05_windows/README.md)
+原 X4000 程序在 `05_windows/project/programs/legacy-x4000`，用于历史版本维护。[安装包构建说明](05_windows/README.md)
 
 ## 固件与配对
 
