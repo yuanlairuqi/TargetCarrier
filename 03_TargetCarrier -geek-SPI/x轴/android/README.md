@@ -2,4 +2,4 @@
 
 手机通过 BLE 控制 X 轴正转、反转和停止。安装 [X 轴交付目录](../交付文件) 中的 APK，配合对应的 ESP 固件使用。
 
-`app/` 是应用源码，`build-apk.ps1` 用于打包。Windows 端见 [上位机入口](../../../05_上位机/00_上位机合集说明.md)。
+`app/` 是应用源码，`build-apk.ps1` 用于打包。Windows 端见 [上位机入口](../../../05_windows/windows-guide.md)。
