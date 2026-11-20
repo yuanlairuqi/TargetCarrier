@@ -12,6 +12,7 @@ AppId=TargetCarrier.Windows
 AppName=TargetCarrier
 AppVersion=7.0
 DefaultDirName={localappdata}\Programs\TargetCarrier
+AppendDefaultDirName=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
