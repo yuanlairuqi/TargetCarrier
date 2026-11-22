@@ -11,6 +11,7 @@ TargetCarrier 统一控制 X 轴和靶车旋转机构，提供装甲灯控、并
 | [工程导航](00_工程导航与汇总/01_当前工程导航与汇总.md) | 查看完整目录和模块入口 |
 | [I²C 工程](<02_TargetCarrier -geek-I2C/README.md>) | 推荐使用，内含 X 轴、靶车和 GEEK 总机 |
 | [UART 工程](<01_TargetCarrier -geek-UART/README.md>)、[SPI 工程](<03_TargetCarrier -geek-SPI/README.md>) | 用于对应板间接口的设备 |
+| [机械结构与图纸](04_机械结构与图纸/README.md) | 靶车 SolidWorks 总装、零件模型与开源技术文档 |
 | [Windows 上位机](05_windows/windows-guide.md) | 控制台、源码和通用调参 |
 
 ## 上位机简明操作手册
